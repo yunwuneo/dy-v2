@@ -1,0 +1,22 @@
+{
+  "apiKey": "在此填入你的 TikHub API Key（或设置环境变量 TIKHUB_API_KEY）",
+  "baseUrl": "https://api.tikhub.io",
+  "region": "CN",
+  "outputDir": "./downloads",
+  "count": 20,
+  "downloadConcurrency": 3,
+  "pollIntervalSeconds": 300,
+  "retry": 3,
+  "timeoutMs": 60000,
+  "cookie": "",
+  "saveMetadata": true,
+  "watchers": [
+    {
+      "identifier": "抖音号、sec_user_id、uid 或主页链接",
+      "name": "可选的显示名称（默认使用昵称）",
+      "types": ["post", "like", "collect"],
+      "limit": 20,
+      "cookie": "收藏列表需要用户自己的抖音 Cookie，可留空"
+    }
+  ]
+}

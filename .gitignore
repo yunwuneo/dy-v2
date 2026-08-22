@@ -1,0 +1,15 @@
+# 依赖
+node_modules/
+
+# 配置（含密钥，不提交）
+config.json
+.env
+
+# 运行产物
+data/
+downloads/
+*.log
+*.part
+
+# 系统文件
+.DS_Store

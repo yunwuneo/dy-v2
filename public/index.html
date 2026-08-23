@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>抖音下载器</title>
+  <link rel="stylesheet" href="/styles.css?v=3">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true">DY</span>
+      <div><strong>抖音下载器</strong><span>本地控制台</span></div>
+    </div>
+    <nav class="main-nav" aria-label="主要功能">
+      <button class="nav-tab active" type="button" data-view="download">下载</button>
+      <button class="nav-tab" type="button" data-view="library">已下载</button>
+    </nav>
+    <div class="server-state"><i id="status-dot"></i><span id="status-text">连接中</span></div>
+  </header>
+
+  <main>
+    <div id="download-view">
+    <section class="command-band" aria-labelledby="workspace-title">
+      <div class="section-heading">
+        <div><p class="eyebrow">下载任务</p><h1 id="workspace-title">查找并保存作品</h1></div>
+        <p id="output-dir" class="output-dir">正在读取保存位置...</p>
+      </div>
+
+      <form id="lookup-form" class="lookup-form">
+        <label class="field field-grow"><span>用户标识</span><input id="identifier" name="identifier" required autocomplete="off" placeholder="抖音号、用户主页链接、UID 或 sec_user_id"></label>
+        <label class="field"><span>内容类型</span><select id="type" name="type"><option value="post">作品</option><option value="like">点赞</option><option value="collect">收藏</option></select></label>
+        <label class="field field-limit"><span>数量</span><input id="limit" name="limit" type="number" min="1" max="200" value="20"></label>
+        <button class="primary" type="submit">查询作品</button>
+      </form>
+
+      <div id="cookie-row" class="cookie-row" hidden>
+        <label class="field field-grow"><span>抖音 Cookie</span><input id="cookie" type="password" autocomplete="off" placeholder="收藏列表需要网页 Cookie"></label>
+        <span id="cookie-hint"></span>
+      </div>
+    </section>
+
+    <section id="notice" class="notice" role="status" aria-live="polite" hidden></section>
+
+    <section id="user-panel" class="user-panel" hidden aria-labelledby="user-name">
+      <div class="avatar" id="user-initial">抖</div>
+      <div class="user-main"><h2 id="user-name"></h2><p id="user-meta"></p><p id="user-signature"></p></div>
+      <dl class="metrics"><div><dt>粉丝</dt><dd id="followers">0</dd></div><div><dt>作品</dt><dd id="aweme-count">0</dd></div><div><dt>获赞</dt><dd id="favorited">0</dd></div></dl>
+    </section>
+
+    <section class="results" aria-labelledby="results-title">
+      <div class="results-head"><div><p class="eyebrow">内容列表</p><h2 id="results-title">尚未查询</h2></div><button id="download-all" class="secondary" type="button" disabled>下载当前列表</button></div>
+      <div id="empty-state" class="empty-state"><strong>输入用户标识开始查询</strong><span>查询不会自动下载文件。</span></div>
+      <div id="video-grid" class="video-grid"></div>
+    </section>
+
+    <section class="single-download" aria-labelledby="single-title">
+      <div><p class="eyebrow">单个作品</p><h2 id="single-title">通过分享链接下载</h2></div>
+      <form id="single-form"><input id="single-url" required placeholder="粘贴作品分享链接或 aweme_id"><button class="secondary" type="submit">立即下载</button></form>
+    </section>
+    </div>
+
+    <div id="library-view" hidden>
+      <section class="library-heading" aria-labelledby="library-title">
+        <div><p class="eyebrow">本地媒体库</p><h1 id="library-title">已下载内容</h1><p class="library-path" id="library-path"></p></div>
+        <button id="refresh-library" class="secondary" type="button">刷新</button>
+      </section>
+      <section id="library-notice" class="notice" role="status" aria-live="polite" hidden></section>
+
+      <dl class="library-stats">
+        <div><dt>全部内容</dt><dd id="stat-total">0</dd></div>
+        <div><dt>视频</dt><dd id="stat-videos">0</dd></div>
+        <div><dt>图集</dt><dd id="stat-albums">0</dd></div>
+        <div><dt>占用空间</dt><dd id="stat-size">0 B</dd></div>
+      </dl>
+
+      <section class="library-content" aria-labelledby="library-results-title">
+        <div class="library-toolbar">
+          <label class="search-field"><span>搜索</span><input id="library-search" type="search" placeholder="标题、作者或作品 ID"></label>
+          <label><span>媒体</span><select id="library-kind"><option value="">全部</option><option value="video">视频</option><option value="album">图集</option></select></label>
+          <label><span>用户</span><select id="library-user"><option value="">全部用户</option></select></label>
+          <label><span>分类</span><select id="library-type"><option value="">全部分类</option></select></label>
+        </div>
+        <div class="library-results-head"><h2 id="library-results-title">正在读取...</h2><span id="orphan-hint"></span></div>
+        <div class="library-table" role="table" aria-label="已下载内容">
+          <div class="library-table-head" role="row"><span>内容</span><span>用户 / 分类</span><span>下载时间</span><span>大小</span><span></span></div>
+          <div id="library-list" role="rowgroup"></div>
+        </div>
+        <div id="library-empty" class="empty-state" hidden><strong>没有匹配的已下载内容</strong><span>调整筛选条件或刷新媒体库。</span></div>
+        <button id="library-more" class="secondary load-more" type="button" hidden>加载更多</button>
+      </section>
+    </div>
+  </main>
+
+  <dialog id="detail-dialog" class="detail-dialog">
+    <div class="dialog-head"><div><p class="eyebrow" id="detail-kind"></p><h2 id="detail-title"></h2></div><button class="icon-button" type="button" data-close-detail aria-label="关闭" title="关闭">×</button></div>
+    <div id="detail-media" class="detail-media"></div>
+    <div id="album-strip" class="album-strip"></div>
+    <dl id="detail-meta" class="detail-meta"></dl>
+    <div class="dialog-actions"><a id="detail-share" class="text-link" target="_blank" rel="noreferrer" hidden>打开抖音链接</a><button id="request-delete" class="danger-button" type="button">删除本地文件</button></div>
+  </dialog>
+
+  <dialog id="delete-dialog" class="confirm-dialog">
+    <h2>删除本地内容？</h2>
+    <p id="delete-message"></p>
+    <div class="dialog-actions"><button class="secondary" type="button" data-cancel-delete>取消</button><button id="confirm-delete" class="danger-button" type="button">确认删除</button></div>
+  </dialog>
+
+  <template id="video-template">
+    <article class="video-card">
+      <div class="cover-wrap"><img class="cover" alt="" loading="lazy"><div class="cover-fallback">无封面</div><span class="kind"></span></div>
+      <div class="video-body"><h3></h3><div class="video-meta"><time></time><code></code></div></div>
+    </article>
+  </template>
+  <template id="library-row-template">
+    <article class="library-row" role="row">
+      <button class="library-preview" type="button"><span class="media-thumb"><img alt="" loading="lazy"><b></b></span><span class="library-title-cell"><strong></strong><small></small></span></button>
+      <span class="library-owner"><strong></strong><small></small></span>
+      <time></time>
+      <span class="library-size"></span>
+      <button class="row-action" type="button">查看</button>
+    </article>
+  </template>
+  <script type="module" src="/app.js?v=3"></script>
+</body>
+</html>

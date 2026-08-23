@@ -6,6 +6,7 @@ import {
   getUserInfo,
   resolveUser,
   resolveSecUserId,
+  resolveUserContext,
   listPosts,
   listLikes,
   listCollection,
@@ -13,6 +14,7 @@ import {
   getSingleVideo,
   awemeMeta,
   extractMetadata,
+  isTransientTikHubError,
 } from './douyin.js';
 import { downloadToFile, writeJsonFile, buildTargetPath, extFromUrl } from './downloader.js';
 import { Store } from './store.js';
@@ -110,8 +112,7 @@ function backfillMetadata(rawItem, userName, typeLabel) {
 }
 
 /** 查询用户信息，返回归一化字段 */
-export async function queryUser(identifier) {
-  const info = await getUserInfo(identifier);
+function normalizeUserInfo(info) {
   return {
     nickname: info?.nickname ?? info?.user?.nickname ?? '',
     unique_id: info?.unique_id ?? info?.user?.unique_id ?? '',
@@ -126,20 +127,12 @@ export async function queryUser(identifier) {
   };
 }
 
-/** 列出某用户某类型的视频/图集（返回元数据列表） */
-export async function listVideos({ identifier, type = 'post', limit = 20, cookie = '' } = {}) {
-  const t = normalizeType(type);
-  const ck = cookie || config.cookie || '';
-  let list;
+export async function queryUser(identifier) {
+  const info = await getUserInfo(identifier);
+  return normalizeUserInfo(info);
+}
 
-  if (t === 'collect') {
-    list = await listCollection({ limit, cookie: ck });
-  } else {
-    const secUserId = await resolveSecUserId(identifier);
-    if (t === 'post') list = await listPosts(secUserId, { limit, cookie: ck });
-    else list = await listLikes(secUserId, { limit, cookie: ck });
-  }
-
+function summarizeVideos(list) {
   return list.map((item) => {
     const meta = awemeMeta(item);
     return {
@@ -151,6 +144,96 @@ export async function listVideos({ identifier, type = 'post', limit = 20, cookie
       image_count: meta.imageUrls.length,
     };
   });
+}
+
+/** 拉取一次可供展示或下载复用的原始批次。 */
+export async function prepareVideoBatch({
+  identifier,
+  type = 'post',
+  limit = 20,
+  cookie = '',
+  userContext = null,
+  secUserId: knownSecUserId = '',
+  userName: knownUserName = '',
+  includeProfile = true,
+  knownStore = null,
+  stopAtKnown = false,
+} = {}) {
+  const t = normalizeType(type);
+  const ck = cookie || config.cookie || '';
+  const label = TYPE_LABEL[t];
+
+  const createBoundaryCheck = (userKey) => {
+    if (!stopAtKnown || !knownStore) return { stopAfterPage: null, reached: () => false };
+    let boundaryReached = false;
+    return {
+      stopAfterPage: (pageItems) => {
+        boundaryReached = pageItems.some((item) => {
+          const awemeId = awemeMeta(item).awemeId;
+          return awemeId && knownStore.has(userKey, t, awemeId);
+        });
+        if (boundaryReached) log.info(`[增量] ${label}已到达本地下载边界，停止继续翻页`);
+        return boundaryReached;
+      },
+      reached: () => boundaryReached,
+    };
+  };
+
+  if (t === 'collect') {
+    const boundary = createBoundaryCheck('self');
+    const list = await listCollection({ limit, cookie: ck, stopAfterPage: boundary.stopAfterPage });
+    return {
+      type: t,
+      label,
+      secUserId: 'self',
+      userName: knownUserName || '我的收藏',
+      info: null,
+      list,
+      stoppedAtKnown: boundary.reached(),
+    };
+  }
+
+  let context = userContext;
+  if (!context && knownSecUserId) {
+    context = { secUserId: knownSecUserId, info: {} };
+  }
+  if (!context) {
+    context = knownUserName
+      ? { secUserId: await resolveSecUserId(identifier), info: {} }
+      : await resolveUserContext(identifier, { includeProfile });
+  }
+
+  const boundary = createBoundaryCheck(context.secUserId);
+  const list = t === 'post'
+    ? await listPosts(context.secUserId, { limit, cookie: ck, stopAfterPage: boundary.stopAfterPage })
+    : await listLikes(context.secUserId, { limit, cookie: ck, stopAfterPage: boundary.stopAfterPage });
+  const info = context.info || {};
+  const userName = knownUserName || info?.nickname || info?.user?.nickname || context.secUserId;
+  return {
+    type: t,
+    label,
+    secUserId: context.secUserId,
+    userName,
+    info,
+    list,
+    stoppedAtKnown: boundary.reached(),
+  };
+}
+
+/** Web 查询一次返回资料和列表，并保留可直接下载的原始批次。 */
+export async function lookupVideos(options = {}) {
+  const prepared = await prepareVideoBatch(options);
+  return {
+    user: prepared.info ? normalizeUserInfo(prepared.info) : null,
+    videos: summarizeVideos(prepared.list),
+    prepared,
+  };
+}
+
+/** 列出某用户某类型的视频/图集（返回元数据列表） */
+export async function listVideos({ identifier, type = 'post', limit = 20, cookie = '' } = {}) {
+  const prepared = await prepareVideoBatch({ identifier, type, limit, cookie, includeProfile: false });
+  return summarizeVideos(prepared.list);
 }
 
 /** 下载单个图集的全部图片到目录，返回结果 */
@@ -165,7 +248,9 @@ async function downloadAlbum({ awemeId, desc, userName, typeLabel, imageUrls, ra
     const ext = extFromUrl(url, '.jpg');
     const imgPath = path.join(albumDir, `img_${String(i + 1).padStart(2, '0')}${ext}`);
     if (!fs.existsSync(imgPath)) {
-      const size = await downloadToFile(url, imgPath);
+      const size = await downloadToFile(url, imgPath, {
+        accept: 'image/jpeg,image/png,image/webp,image/avif',
+      });
       files.push({ file: imgPath, size });
     } else {
       files.push({ file: imgPath, size: fs.statSync(imgPath).size });
@@ -187,9 +272,14 @@ async function downloadAlbum({ awemeId, desc, userName, typeLabel, imageUrls, ra
 export async function downloadSingle(identifier) {
   let awemeId = identifier;
   const resolved = await resolveUser(identifier);
-  if (resolved.aweme_id) awemeId = resolved.awemeId;
+  if (resolved.aweme_id) awemeId = resolved.aweme_id;
 
-  const detail = await getSingleVideo(awemeId).catch(() => ({}));
+  let detail = {};
+  try {
+    detail = await getSingleVideo(awemeId);
+  } catch (error) {
+    if (!isTransientTikHubError(error)) throw error;
+  }
   const aweme = detail?.aweme_detail ?? detail?.aweme ?? detail ?? {};
   const desc = String(aweme?.desc ?? detail?.desc ?? '').trim();
   const nickname = aweme?.author?.nickname || detail?.author?.nickname || '';
@@ -217,60 +307,80 @@ export async function downloadSingle(identifier) {
     };
   }
 
-  // 视频：走高清接口
+  const { dir, file } = buildTargetPath(nickname || '单视频', nickname ? '单视频' : '', awemeId, desc || awemeId);
+  if (fs.existsSync(file)) {
+    // 视频已存在：若缺元数据 JSON 则补写，无需再请求高清播放地址。
+    const jsonFile = file.replace(/\.mp4$/i, '.json');
+    let metadataBackfilled = false;
+    if (!fs.existsSync(jsonFile)) {
+      metadataBackfilled = !!saveMetadata(aweme, { file }, {
+        file,
+        size: fs.statSync(file).size,
+        downloaded_at: fs.statSync(file).mtime.toISOString(),
+        backfilled_at: new Date().toISOString(),
+      });
+    }
+    return { aweme_id: awemeId, kind: 'video', desc, file, dir, size: fs.statSync(file).size, existed: true, metadata_backfilled: metadataBackfilled };
+  }
+
   const info = await getVideoDownloadUrl(awemeId);
   const url = info?.original_video_url || info?.video_url || info?.url;
   if (!url) throw new Error(`未获取到下载地址: ${awemeId}`);
-
-  const { dir, file } = buildTargetPath(nickname || '单视频', nickname ? '单视频' : '', awemeId, desc || awemeId);
-  if (!fs.existsSync(file)) {
-    const size = await downloadToFile(url, file);
-    saveMetadata(aweme, { file }, { file, size, downloaded_at: new Date().toISOString() });
-    return { aweme_id: awemeId, kind: 'video', desc, file, dir, size, url };
-  }
-  // 视频已存在：若缺元数据 JSON 则补写
-  const jsonFile = file.replace(/\.mp4$/i, '.json');
-  let metadataBackfilled = false;
-  if (!fs.existsSync(jsonFile)) {
-    metadataBackfilled = !!saveMetadata(aweme, { file }, {
-      file,
-      size: fs.statSync(file).size,
-      downloaded_at: fs.statSync(file).mtime.toISOString(),
-      backfilled_at: new Date().toISOString(),
-    });
-  }
-  return { aweme_id: awemeId, kind: 'video', desc, file, dir, size: fs.statSync(file).size, url, existed: true, metadata_backfilled: metadataBackfilled };
+  const size = await downloadToFile(url, file);
+  saveMetadata(aweme, { file }, { file, size, downloaded_at: new Date().toISOString() });
+  return { aweme_id: awemeId, kind: 'video', desc, file, dir, size, url };
 }
 
 /** 下载某用户某类型的全部（或前 N 个）作品，自动区分视频与图集 */
-export async function downloadVideos({ identifier, type = 'post', limit = Infinity, cookie = '' } = {}) {
-  const t = normalizeType(type);
-  const ck = cookie || config.cookie || '';
-  const label = TYPE_LABEL[t];
-
-  let secUserId = 'self';
-  let userName = label;
+export async function downloadVideos({
+  identifier,
+  type = 'post',
+  limit = Infinity,
+  cookie = '',
+  prepared = null,
+  userContext = null,
+  secUserId = '',
+  userName = '',
+  store: providedStore = null,
+} = {}) {
+  const store = providedStore || new Store();
+  let batch;
   try {
-    if (t === 'collect') {
-      userName = '我的收藏';
-    } else {
-      secUserId = await resolveSecUserId(identifier);
-      const info = await getUserInfo(identifier).catch(() => ({}));
-      userName = info?.nickname || info?.user?.nickname || secUserId;
-    }
+    batch = prepared || await prepareVideoBatch({
+      identifier,
+      type,
+      limit,
+      cookie,
+      userContext,
+      secUserId,
+      userName,
+      knownStore: store,
+      stopAtKnown: true,
+    });
   } catch (e) {
     throw new Error(`解析用户失败: ${e.message}`);
   }
 
-  const store = new Store();
+  const t = batch.type;
+  const label = batch.label;
+  secUserId = batch.secUserId;
+  userName = batch.userName;
+
   const userKey = secUserId || 'self';
 
-  let list;
-  if (t === 'post') list = await listPosts(secUserId, { limit, cookie: ck });
-  else if (t === 'like') list = await listLikes(secUserId, { limit, cookie: ck });
-  else list = await listCollection({ limit, cookie: ck });
+  const list = batch.list;
 
-  const stats = { type: t, label, total: list.length, downloaded: 0, skipped: 0, metadata_backfilled: 0, failed: 0, files: [] };
+  const stats = {
+    type: t,
+    label,
+    total: list.length,
+    downloaded: 0,
+    skipped: 0,
+    metadata_backfilled: 0,
+    failed: 0,
+    stopped_at_known: Boolean(batch.stoppedAtKnown),
+    files: [],
+  };
 
   for (const item of list) {
     const meta = awemeMeta(item);

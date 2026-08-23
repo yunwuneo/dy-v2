@@ -37,7 +37,9 @@ export async function resolveUser(identifier) {
 
 /** 获取用户信息（自动识别标识类型） */
 export async function getUserInfo(identifier) {
-  const id = await resolveUser(identifier);
+  const id = identifier && typeof identifier === 'object'
+    ? identifier
+    : await resolveUser(identifier);
   let r;
   if (id.sec_user_id) {
     r = await tikhubRequest(`${WEB}/handler_user_profile`, { query: { sec_user_id: id.sec_user_id } });
@@ -50,18 +52,45 @@ export async function getUserInfo(identifier) {
   return data?.user ?? data ?? {};
 }
 
+/**
+ * 一次性解析用户标识、资料与 sec_user_id，供同一业务流程复用。
+ * 已直接提供 sec_user_id 且不需要资料时，不额外请求用户资料接口。
+ */
+export async function resolveUserContext(identifier, { includeProfile = true } = {}) {
+  const resolved = await resolveUser(identifier);
+  if (resolved.sec_user_id && !includeProfile) {
+    return { resolved, info: {}, secUserId: resolved.sec_user_id };
+  }
+
+  const info = await getUserInfo(resolved);
+  const secUserId = resolved.sec_user_id
+    || info?.sec_user_id
+    || info?.sec_uid
+    || info?.sec_user?.sec_uid;
+  if (!secUserId) throw new TikHubError('未能解析出 sec_user_id，请检查用户标识是否正确', 400);
+  return { resolved, info, secUserId };
+}
+
 /** 解析出 sec_user_id（作品/点赞列表都需要它） */
 export async function resolveSecUserId(identifier) {
-  const id = await resolveUser(identifier);
-  if (id.sec_user_id) return id.sec_user_id;
-  const info = await getUserInfo(identifier);
-  const sec = info?.sec_user_id || info?.sec_uid || info?.sec_user?.sec_uid;
-  if (!sec) throw new TikHubError('未能解析出 sec_user_id，请检查用户标识是否正确', 400);
-  return sec;
+  const context = await resolveUserContext(identifier, { includeProfile: false });
+  return context.secUserId;
+}
+
+export function isTransientTikHubError(error) {
+  if (!(error instanceof TikHubError)) return true;
+  const code = Number(error.code);
+  return code === 408 || code === 425 || code === 429 || code >= 500;
+}
+
+function canFallbackToWeb(error) {
+  if (isTransientTikHubError(error)) return true;
+  const code = Number(error.code);
+  return code === 404 || code === 405 || code === 501;
 }
 
 /** 通用分页拉取，fetchPage(cursor) 返回 { aweme_list, has_more, max_cursor } */
-async function paginate(fetchPage, { limit = Infinity, maxPages = 200 } = {}) {
+async function paginate(fetchPage, { limit = Infinity, maxPages = 200, stopAfterPage = null } = {}) {
   const items = [];
   let cursor = 0;
   let hasMore = true;
@@ -71,6 +100,7 @@ async function paginate(fetchPage, { limit = Infinity, maxPages = 200 } = {}) {
     const page = await fetchPage(cursor);
     const list = page?.aweme_list || [];
     items.push(...list);
+    if (list.length > 0 && stopAfterPage?.(list, { cursor, pages })) break;
     const more = page?.has_more;
     const nextCursor = page?.max_cursor;
     hasMore = !!more && list.length > 0;
@@ -81,7 +111,7 @@ async function paginate(fetchPage, { limit = Infinity, maxPages = 200 } = {}) {
 }
 
 /** 用户作品列表：优先 App V3（更稳定），失败降级 Web 版 */
-export function listPosts(secUserId, { limit = Infinity, filterType = 0, cookie = '' } = {}) {
+export function listPosts(secUserId, { limit = Infinity, filterType = 0, cookie = '', stopAfterPage = null } = {}) {
   const fetchPageApp = async (cursor) => {
     const r = await tikhubRequest('/api/v1/douyin/app/v3/fetch_user_post_videos', {
       query: { sec_user_id: secUserId, max_cursor: cursor, count: config.count },
@@ -104,14 +134,15 @@ export function listPosts(secUserId, { limit = Infinity, filterType = 0, cookie 
     try {
       return await fetchPageApp(cursor);
     } catch (e) {
+      if (!canFallbackToWeb(e)) throw e;
       log.warn(`App V3 作品接口失败（${e.message}），降级 Web 版重试`);
       return fetchPageWeb(cursor);
     }
-  }, { limit });
+  }, { limit, stopAfterPage });
 }
 
 /** 用户点赞列表：优先 App V3（无需 Cookie），失败降级 Web 版 */
-export function listLikes(secUserId, { limit = Infinity, cookie = '' } = {}) {
+export function listLikes(secUserId, { limit = Infinity, cookie = '', stopAfterPage = null } = {}) {
   const fetchPageApp = async (cursor) => {
     const r = await tikhubRequest('/api/v1/douyin/app/v3/fetch_user_like_videos', {
       query: { sec_user_id: secUserId, max_cursor: cursor, counts: config.count },
@@ -129,14 +160,15 @@ export function listLikes(secUserId, { limit = Infinity, cookie = '' } = {}) {
     try {
       return await fetchPageApp(cursor);
     } catch (e) {
+      if (!canFallbackToWeb(e)) throw e;
       log.warn(`App V3 点赞接口失败（${e.message}），降级 Web 版重试`);
       return fetchPageWeb(cursor);
     }
-  }, { limit });
+  }, { limit, stopAfterPage });
 }
 
 /** 用户收藏列表（需要用户自己的抖音 Cookie） */
-export function listCollection({ limit = Infinity, cookie = '' } = {}) {
+export function listCollection({ limit = Infinity, cookie = '', stopAfterPage = null } = {}) {
   const ck = cookie || config.cookie;
   if (!ck) {
     throw new TikHubError('收藏列表需要用户自己的抖音网页 Cookie（config.json 的 cookie 或 watcher.cookie）', 400);
@@ -147,7 +179,7 @@ export function listCollection({ limit = Infinity, cookie = '' } = {}) {
       body: { cookie: ck, max_cursor: cursor, counts: config.count },
     });
     return r?.data ?? {};
-  }, { limit });
+  }, { limit, stopAfterPage });
 }
 
 /** 获取单个视频的最高画质（无水印）下载地址（该接口偶发瞬时 400，做业务级重试） */
@@ -162,6 +194,7 @@ export async function getVideoDownloadUrl(awemeId) {
       return r?.data ?? {};
     } catch (e) {
       lastErr = e;
+      if (!isTransientTikHubError(e)) throw e;
       if (attempt < 2) await new Promise((r) => setTimeout(r, 1200 * (attempt + 1)));
     }
   }

@@ -43,4 +43,20 @@ export class Store {
     this.data[userKey][type][String(awemeId)] = Date.now();
     this._save();
   }
+
+  removeAweme(awemeId) {
+    const key = String(awemeId || '');
+    if (!key) return false;
+    let removed = false;
+    for (const user of Object.values(this.data)) {
+      for (const records of Object.values(user || {})) {
+        if (records?.[key]) {
+          delete records[key];
+          removed = true;
+        }
+      }
+    }
+    if (removed) this._save();
+    return removed;
+  }
 }

@@ -12,7 +12,8 @@
     "download": "node src/cli.js download",
     "watch": "node src/cli.js watch",
     "serve": "node src/cli.js serve",
-    "mcp": "node src/cli.js mcp"
+    "mcp": "node src/cli.js mcp",
+    "test": "node --test"
   },
   "engines": {
     "node": ">=18.0.0"

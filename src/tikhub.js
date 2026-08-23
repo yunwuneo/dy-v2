@@ -10,6 +10,15 @@ export class TikHubError extends Error {
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const inFlightRequests = new Map();
+
+function stableValue(value) {
+  if (Array.isArray(value)) return value.map(stableValue);
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(Object.keys(value).sort().map((key) => [key, stableValue(value[key])]));
+  }
+  return value;
+}
 
 function assertKey() {
   if (!config.apiKey || config.apiKey.includes('在此填入') || config.apiKey === 'your_tikhub_api_key_here') {
@@ -26,7 +35,7 @@ function assertKey() {
  * @param {object} opts { method, query, body, retries }
  * @returns {Promise<object>} 响应 JSON（含 code/router/data）
  */
-export async function tikhubRequest(path, { method = 'GET', query = {}, body = null, retries = config.retry } = {}) {
+async function performRequest(path, { method = 'GET', query = {}, body = null, retries = config.retry } = {}) {
   assertKey();
   const baseUrl = String(config.baseUrl).replace(/\/+$/, '');
   const url = new URL(baseUrl + path);
@@ -79,4 +88,21 @@ export async function tikhubRequest(path, { method = 'GET', query = {}, body = n
     }
   }
   throw lastErr || new TikHubError('请求失败', -1, path);
+}
+
+export function tikhubRequest(path, options = {}) {
+  const method = options.method || 'GET';
+  const query = options.query || {};
+  const body = options.body ?? null;
+  const retries = options.retries ?? config.retry;
+  const key = JSON.stringify([method, path, stableValue(query), stableValue(body), retries]);
+  const existing = inFlightRequests.get(key);
+  if (existing) return existing;
+
+  let tracked;
+  tracked = performRequest(path, options).finally(() => {
+    if (inFlightRequests.get(key) === tracked) inFlightRequests.delete(key);
+  });
+  inFlightRequests.set(key, tracked);
+  return tracked;
 }

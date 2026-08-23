@@ -44,13 +44,14 @@ export function writeJsonFile(destPath, data) {
 }
 
 /** 将远程视频流式写入本地文件，返回文件字节数 */
-export async function downloadToFile(url, destPath, { timeoutMs = 180000 } = {}) {
+export async function downloadToFile(url, destPath, { timeoutMs = 180000, accept = '*/*' } = {}) {
   const res = await fetch(url, {
     redirect: 'follow',
     headers: {
       'User-Agent':
         'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
       Referer: 'https://www.douyin.com/',
+      Accept: accept,
     },
     signal: AbortSignal.timeout(timeoutMs),
   });

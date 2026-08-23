@@ -15,7 +15,7 @@ const HELP = `抖音视频下载器 (基于 TikHub API)
   download --url <链接|aweme_id>      下载单个作品（分享链接或作品 id，支持视频与图集）
   watch                               启动轮询监听（自动下载 config.json 中 watchers 的新增视频）
   watch --once                        只执行一次监听检查后退出
-  serve [--port 8787]                 启动 HTTP JSON API（供 Openclaw / 脚本调用）
+  serve [--port 8787]                 启动 Web UI 与 HTTP JSON API
   mcp                                 启动 MCP 服务器（stdio，供 Openclaw 的 mcpServers 接入）
 
 download 选项:

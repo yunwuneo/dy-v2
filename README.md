@@ -7,6 +7,7 @@
 - ✅ **轮询监听**，自动下载监听目标的新增视频，并按「用户 / 类型」分类归档
 - ✅ 下载**高清无水印**原画质视频（`fetch_video_high_quality_play_url`）
 - ✅ 与 **Openclaw** 交互：通过 MCP 服务器、HTTP JSON API 或 CLI 三种方式触发查询与下载
+- ✅ 内置 **Web UI**：查询和下载作品，并在管理后台预览、筛选与删除本地内容
 
 > 本项目仅用于个人学习与合法用途，请遵守抖音平台用户协议及相关法律法规，勿用于侵权或商业盗用。
 
@@ -36,6 +37,10 @@ node src/cli.js download <抖音号> --type collect --cookie "你的抖音Cookie
 
 # 5. 下载单个视频（分享链接或 aweme_id）
 node src/cli.js download --url "https://v.douyin.com/xxxx/"
+
+# 6. 启动 Web UI
+npm run serve
+# 浏览器访问 http://127.0.0.1:8787
 ```
 
 ## 配置说明（`config.json`）
@@ -78,7 +83,7 @@ download <标识> [--type post|like|collect] [--limit N] [--cookie ...]
 download --url <链接|aweme_id>      下载单个视频
 list <标识> [--type ...] [--limit N] 列出视频元数据（不下载）
 watch [--once]                      启动轮询监听（--once 只跑一次）
-serve [--port 8787]                 启动 HTTP JSON API
+serve [--port 8787]                 启动 Web UI 与 HTTP JSON API
 mcp                                 启动 MCP 服务器（stdio）
 ```
 
@@ -163,13 +168,26 @@ openclaw mcp doctor douyin --probe
 node src/cli.js serve --port 8787
 ```
 
+服务启动后，直接访问 `http://127.0.0.1:8787` 即可使用 Web UI：
+
+- **下载**：用户信息查询、作品/点赞/收藏预览、批量下载及分享链接单项下载。
+- **已下载**：本地媒体统计、标题/作者/作品 ID 搜索、用户/分类/媒体筛选、视频播放、图集浏览、元数据查看和本地文件删除。
+
+管理后台只扫描 `outputDir`，媒体读取和删除操作均限制在该目录内。删除作品会同时清理配套元数据和去重记录，之后可以重新下载。
+
 | 路由 | 方法 | 说明 |
 | --- | --- | --- |
 | `/health` | GET | 健康检查 |
 | `/api/user?identifier=xxx` | GET | 查询用户信息 |
 | `/api/list?identifier=xxx&type=post&limit=20` | GET | 列出视频 |
+| `/api/list` | POST | 列出视频 `{identifier,type,limit,cookie}`（适合传 Cookie） |
+| `/api/lookup` | POST | 一次查询用户与列表并返回可复用的 `lookupId` |
 | `/api/download` | POST | 批量下载 `{identifier,type,limit,cookie}` |
 | `/api/download/single` | POST | 下载单个 `{url}` |
+| `/api/library` | GET | 获取本地媒体库列表与统计 |
+| `/api/library/item?id=...` | GET | 获取单条本地媒体详情 |
+| `/api/library/media?id=...&file=0` | GET | 读取本地视频或图集图片（支持 Range） |
+| `/api/library/item?id=...` | DELETE | 删除本地媒体、元数据与去重记录 |
 
 ```bash
 curl "http://127.0.0.1:8787/api/user?identifier=抖音号"
@@ -204,6 +222,7 @@ node /Users/neo/repos/dy/src/cli.js download <抖音号> --type post --limit 10
 
 - **收藏列表**需要用户自己的抖音网页 Cookie（`config.json` 的 `cookie` 或 watcher 的 `cookie`），因为收藏属于私密数据。
 - TikHub 接口按次计费，轮询会持续消耗额度，请合理设置 `pollIntervalSeconds` 与 `limit`。
+- 下载与 watcher 使用增量分页：当前页出现本地已下载作品后停止继续翻页，但仍处理完整的边界页。
 - 抖音 Web 接口可能偶发不稳定，若作品列表为空请重试或改用 App 接口。
 - 下载的视频请勿用于商业盗用，责任自负。
 

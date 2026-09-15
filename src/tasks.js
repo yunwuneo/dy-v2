@@ -248,16 +248,22 @@ export async function listVideos({ identifier, type = 'post', limit = 20, cookie
 
 /** 下载单个图集的全部图片到目录，返回结果 */
 async function downloadAlbum({ awemeId, desc, userName, typeLabel, imageUrls, rawItem = null }) {
-  const { dir, file: firstFile } = buildTargetPath(userName, typeLabel, awemeId, desc);
+  const { file: firstFile } = buildTargetPath(userName, typeLabel, awemeId, desc);
   // 去掉 .mp4 后缀作为图集目录：<用户>/<类型>/<标题>_<awemeId>/
   const albumDir = firstFile.replace(/\.[^.]+$/, '');
-  fs.mkdirSync(albumDir, { recursive: true });
+  let entries = [];
+  try {
+    entries = fs.readdirSync(albumDir, { withFileTypes: true });
+  } catch (error) {
+    // 首次下载时目录尚不存在，由图片下载器在写入时创建。
+    if (error.code !== 'ENOENT') throw error;
+  }
   const files = [];
   for (let i = 0; i < imageUrls.length; i++) {
     const url = imageUrls[i];
     if (!url) continue;
     const prefix = `img_${String(i + 1).padStart(2, '0')}`;
-    const existing = fs.readdirSync(albumDir, { withFileTypes: true }).find((entry) => entry.isFile() && entry.name.startsWith(`${prefix}.`));
+    const existing = entries.find((entry) => entry.isFile() && entry.name.startsWith(`${prefix}.`) && !entry.name.endsWith('.part'));
     if (existing) {
       let imgPath = path.join(albumDir, existing.name);
       const fd = fs.openSync(imgPath, 'r');

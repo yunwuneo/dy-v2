@@ -55,6 +55,8 @@ npm run serve
 | `pollIntervalSeconds` | 轮询间隔（秒） |
 | `cookie` | 全局抖音 Cookie（**收藏列表必需**） |
 | `saveMetadata` | 是否随媒体保存元数据 JSON（默认 `true`） |
+| `logDir` | 运行日志目录，默认 `./logs`（写入 `app.log`） |
+| `errorDir` | 结构化错误报告目录，默认 `./errors`（每次接口/下载失败写入 JSON） |
 | `watchers` | 轮询监听目标数组 |
 
 ### 监听目标（watcher）示例

@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { config } from './config.js';
-import { log } from './logger.js';
+import { log, writeErrorReport } from './logger.js';
 import {
   getUserInfo,
   resolveUser,
@@ -16,7 +16,7 @@ import {
   extractMetadata,
   isTransientTikHubError,
 } from './douyin.js';
-import { downloadToFile, writeJsonFile, buildTargetPath, extFromUrl } from './downloader.js';
+import { downloadToFile, downloadImageToFile, detectMediaExtension, writeJsonFile, buildTargetPath } from './downloader.js';
 import { Store } from './store.js';
 
 export const TYPE_LABEL = { post: '作品', like: '点赞', collect: '收藏' };
@@ -146,6 +146,16 @@ function summarizeVideos(list) {
   });
 }
 
+function embeddedVideoUrl(item) {
+  const aweme = item?.aweme ?? item;
+  const candidates = [
+    ...(aweme?.video?.play_addr?.url_list || []),
+    ...(aweme?.video?.download_addr?.url_list || []),
+    ...(aweme?.video?.bit_rate || []).flatMap((rate) => rate?.play_addr?.url_list || []),
+  ];
+  return candidates.find((url) => typeof url === 'string' && /^https?:\/\//i.test(url)) || '';
+}
+
 /** 拉取一次可供展示或下载复用的原始批次。 */
 export async function prepareVideoBatch({
   identifier,
@@ -241,19 +251,28 @@ async function downloadAlbum({ awemeId, desc, userName, typeLabel, imageUrls, ra
   const { dir, file: firstFile } = buildTargetPath(userName, typeLabel, awemeId, desc);
   // 去掉 .mp4 后缀作为图集目录：<用户>/<类型>/<标题>_<awemeId>/
   const albumDir = firstFile.replace(/\.[^.]+$/, '');
+  fs.mkdirSync(albumDir, { recursive: true });
   const files = [];
   for (let i = 0; i < imageUrls.length; i++) {
     const url = imageUrls[i];
     if (!url) continue;
-    const ext = extFromUrl(url, '.jpg');
-    const imgPath = path.join(albumDir, `img_${String(i + 1).padStart(2, '0')}${ext}`);
-    if (!fs.existsSync(imgPath)) {
-      const size = await downloadToFile(url, imgPath, {
-        accept: 'image/jpeg,image/png,image/webp,image/avif',
-      });
-      files.push({ file: imgPath, size });
-    } else {
+    const prefix = `img_${String(i + 1).padStart(2, '0')}`;
+    const existing = fs.readdirSync(albumDir, { withFileTypes: true }).find((entry) => entry.isFile() && entry.name.startsWith(`${prefix}.`));
+    if (existing) {
+      let imgPath = path.join(albumDir, existing.name);
+      const fd = fs.openSync(imgPath, 'r');
+      const header = Buffer.alloc(32);
+      try { fs.readSync(fd, header, 0, header.length, 0); } finally { fs.closeSync(fd); }
+      const actualExt = detectMediaExtension(header, '', imgPath);
+      const currentExt = path.extname(imgPath).toLowerCase();
+      if (actualExt && actualExt !== currentExt) {
+        const corrected = path.join(albumDir, `${prefix}${actualExt}`);
+        if (!fs.existsSync(corrected)) fs.renameSync(imgPath, corrected);
+        imgPath = corrected;
+      }
       files.push({ file: imgPath, size: fs.statSync(imgPath).size });
+    } else {
+      files.push(await downloadImageToFile(url, albumDir, i + 1));
     }
   }
   // 图集元数据保存到图集目录内：metadata.json（与图片同级）
@@ -323,8 +342,16 @@ export async function downloadSingle(identifier) {
     return { aweme_id: awemeId, kind: 'video', desc, file, dir, size: fs.statSync(file).size, existed: true, metadata_backfilled: metadataBackfilled };
   }
 
-  const info = await getVideoDownloadUrl(awemeId);
-  const url = info?.original_video_url || info?.video_url || info?.url;
+  let info = {};
+  let url = '';
+  try {
+    info = await getVideoDownloadUrl(awemeId);
+    url = info?.original_video_url || info?.video_url || info?.url || '';
+  } catch (error) {
+    url = embeddedVideoUrl(aweme);
+    if (!url) throw error;
+    log.warn(`[单视频] ${awemeId} 高清地址接口失败，改用详情内播放地址: ${error.message}`);
+  }
   if (!url) throw new Error(`未获取到下载地址: ${awemeId}`);
   const size = await downloadToFile(url, file);
   saveMetadata(aweme, { file }, { file, size, downloaded_at: new Date().toISOString() });
@@ -415,8 +442,16 @@ export async function downloadVideos({
       }
 
       // ── 普通视频 ──
-      const info = await getVideoDownloadUrl(meta.awemeId);
-      const url = info?.original_video_url || info?.video_url || info?.url;
+      let info = {};
+      let url = '';
+      try {
+        info = await getVideoDownloadUrl(meta.awemeId);
+        url = info?.original_video_url || info?.video_url || info?.url || '';
+      } catch (error) {
+        url = embeddedVideoUrl(item);
+        if (!url) throw error;
+        log.warn(`[${label}] ${meta.awemeId} 高清地址接口失败，改用列表内播放地址: ${error.message}`);
+      }
       if (!url) { stats.failed += 1; log.warn(`[${label}] ${meta.awemeId} 无下载地址`); continue; }
 
       const { file, dir } = buildTargetPath(userName, label, meta.awemeId, meta.desc);
@@ -434,7 +469,8 @@ export async function downloadVideos({
       log.ok(`[视频] ${meta.desc || meta.awemeId}  (${(size / 1024 / 1024).toFixed(2)} MB)`);
     } catch (e) {
       stats.failed += 1;
-      log.error(`[${label}] ${meta.awemeId} 下载失败: ${e.message}`);
+      const report = writeErrorReport('item-download', e, { label, awemeId: meta.awemeId, desc: meta.desc, userName, type: t });
+      log.error(`[${label}] ${meta.awemeId} 下载失败: ${e.message}${report ? `（详情: ${report}）` : ''}`);
     }
   }
 

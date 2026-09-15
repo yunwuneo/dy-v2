@@ -1,11 +1,13 @@
 import { config } from './config.js';
+import { log, writeErrorReport } from './logger.js';
 
 export class TikHubError extends Error {
-  constructor(message, code = -1, router = '') {
+  constructor(message, code = -1, router = '', details = {}) {
     super(message);
     this.name = 'TikHubError';
     this.code = code;
     this.router = router;
+    Object.assign(this, details);
   }
 }
 
@@ -65,7 +67,8 @@ async function performRequest(path, { method = 'GET', query = {}, body = null, r
       });
 
       if (res.status === 429 || res.status >= 500) {
-        lastErr = new TikHubError(`HTTP ${res.status}（第 ${i + 1} 次尝试）`, res.status, path);
+        lastErr = new TikHubError(`HTTP ${res.status}（第 ${i + 1} 次尝试）`, res.status, path, { httpStatus: res.status, query });
+        writeErrorReport('tikhub-http', lastErr, { method, path, query, attempt: i + 1, status: res.status });
         await sleep(1000 * (i + 1));
         continue;
       }
@@ -74,16 +77,30 @@ async function performRequest(path, { method = 'GET', query = {}, body = null, r
       // 兼容两种错误格式：{code,message} 与 {detail:{code,message,...}}
       if ((json.detail?.code && Number(json.detail.code) !== 200) || (json.code && Number(json.code) !== 200)) {
         const d = json.detail ?? json;
-        throw new TikHubError(
+        const err = new TikHubError(
           d.message_zh || d.message || d.msg || `接口返回 code=${d.code}`,
           d.code,
           d.router || path,
+          { requestId: json.request_id, docs: json.docs, support: json.support, cacheUrl: json.cache_url, response: json },
         );
+        // TikHub uses business code 400 for a transient upstream failure. Deterministic
+        // validation errors (for example "invalid aweme_id") must remain single-shot.
+        const retryable = Number(err.code) === 408 || Number(err.code) === 425 || Number(err.code) === 429 || Number(err.code) >= 500
+          || /请求失败，请重试|request failed.*retry/i.test(err.message);
+        writeErrorReport('tikhub-response', err, { method, path, query, attempt: i + 1, response: json, retryable });
+        if (retryable && i < retries - 1) {
+          lastErr = err;
+          log.warn(`TikHub ${path} 返回可重试错误（第 ${i + 1}/${retries} 次）: ${err.message}`);
+          await sleep(1000 * (i + 1));
+          continue;
+        }
+        throw err;
       }
       return json;
     } catch (e) {
       if (e instanceof TikHubError) throw e;
       lastErr = e;
+      writeErrorReport('tikhub-network', e, { method, path, query, attempt: i + 1 });
       if (i < retries - 1) await sleep(1000 * (i + 1));
     }
   }

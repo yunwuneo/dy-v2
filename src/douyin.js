@@ -80,7 +80,8 @@ export async function resolveSecUserId(identifier) {
 export function isTransientTikHubError(error) {
   if (!(error instanceof TikHubError)) return true;
   const code = Number(error.code);
-  return code === 408 || code === 425 || code === 429 || code >= 500;
+  return code === 408 || code === 425 || code === 429 || code >= 500
+    || /请求失败，请重试|request failed.*retry/i.test(error.message || '');
 }
 
 function canFallbackToWeb(error) {
@@ -217,10 +218,13 @@ export function awemeMeta(item) {
   // 图集/图片帖：images 数组非空（通常 media_type=2/42）
   const rawImages = Array.isArray(aweme?.images) ? aweme.images : [];
   const isImagePost = rawImages.length > 0;
-  // 每张图挑选最佳 URL：优先非 HEIC 格式（兼容性更好），否则退回第一个
+  // 每张图挑选最佳 URL：详情接口通常同时返回 JPEG/WEBP 与 vvic，优先兼容性更好的 JPEG。
   const imageUrls = rawImages.map((img) => {
-    const urls = img?.url_list ?? [];
-    return urls.find((u) => !/\.(heic|hif)(\?|$)/i.test(u)) || urls[0] || '';
+    const urls = [...(img?.download_url_list ?? []), ...(img?.url_list ?? [])];
+    return urls.find((u) => /\.(jpe?g)(?:[?#]|$)/i.test(u))
+      || urls.find((u) => /\.(png|webp|avif)(?:[?#]|$)/i.test(u))
+      || urls.find((u) => !/\.(heic|heif|hif)(?:[?#]|$)/i.test(u))
+      || urls[0] || '';
   });
   return { awemeId, desc, createTime, cover, isImagePost, imageUrls };
 }

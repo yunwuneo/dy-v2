@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { config } from './config.js';
-import { log } from './logger.js';
+import { log, writeErrorReport } from './logger.js';
 import { queryUser, listVideos, lookupVideos, downloadSingle, downloadVideos, VALID_TYPES } from './tasks.js';
 import { deleteLibraryItem, getLibraryItem, getLibraryMedia, listLibrary } from './library.js';
 import { Store } from './store.js';
@@ -76,7 +76,10 @@ function contentTypeFor(file) {
     '.jpg': 'image/jpeg',
     '.jpeg': 'image/jpeg',
     '.png': 'image/png',
-    '.webp': 'image/webp',
+  '.webp': 'image/webp',
+  '.avif': 'image/avif',
+  '.heic': 'image/heic',
+  '.heif': 'image/heif',
     '.gif': 'image/gif',
     '.bmp': 'image/bmp',
   }[path.extname(file).toLowerCase()] || 'application/octet-stream';
@@ -264,6 +267,7 @@ async function handle(req, res) {
 
     return sendJson(res, 404, { error: '未找到该路由', path });
   } catch (e) {
+    writeErrorReport('http-handler', e, { method, path, query: Object.fromEntries(q) });
     return sendJson(res, e.statusCode || 500, { error: e.message });
   }
 }

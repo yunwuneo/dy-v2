@@ -10,6 +10,7 @@ const {
   getUserInfo,
   getVideoDownloadUrl,
   listPosts,
+  awemeMeta,
 } = await import('../src/douyin.js');
 const {
   downloadVideos,
@@ -20,7 +21,21 @@ const {
 } = await import('../src/tasks.js');
 const { runWatcherOnce } = await import('../src/poller.js');
 const { config } = await import('../src/config.js');
-const { buildTargetPath } = await import('../src/downloader.js');
+const { buildTargetPath, sanitize } = await import('../src/downloader.js');
+
+test('image metadata prefers JPEG download URLs over vvic originals', () => {
+  const meta = awemeMeta({
+    aweme_id: 'image-id',
+    images: [{
+      url_list: ['https://cdn.example/image~vvic'],
+      download_url_list: [
+        'https://cdn.example/image.webp',
+        'https://cdn.example/image.jpeg?signature=1',
+      ],
+    }],
+  });
+  assert.equal(meta.imageUrls[0], 'https://cdn.example/image.jpeg?signature=1');
+});
 
 function response(data) {
   return new Response(JSON.stringify(data), {
@@ -173,6 +188,30 @@ test('deterministic high-quality URL errors are not retried', async () => {
   } finally {
     mock.restore();
   }
+});
+
+test('TikHub transient business 400 errors are retried with the same parameters', async () => {
+  let attempts = 0;
+  const mock = installFetch(() => {
+    attempts += 1;
+    if (attempts === 1) return response({ code: 400, message_zh: '请求失败，请重试。', router: '/api/v1/douyin/web/fetch_video_high_quality_play_url' });
+    return response({ code: 200, data: { original_video_url: 'https://cdn.example/video.mp4' } });
+  });
+  try {
+    const result = await getVideoDownloadUrl('transient-id');
+    assert.equal(result.original_video_url, 'https://cdn.example/video.mp4');
+    assert.equal(attempts, 2);
+  } finally {
+    mock.restore();
+  }
+});
+
+test('long multibyte titles are truncated by bytes for filesystem-safe paths', () => {
+  const title = sanitize('标题😀'.repeat(100), 100);
+  assert.ok(Buffer.byteLength(title, 'utf8') <= 100);
+  assert.equal(title, title.normalize());
+  const { file } = buildTargetPath('用户'.repeat(100), '点赞', '7679313983878253866', '标题😀'.repeat(100));
+  assert.ok(Buffer.byteLength(file.split('/').pop(), 'utf8') < 255);
 });
 
 test('an existing single video does not request a high-quality URL again', async () => {

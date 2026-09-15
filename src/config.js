@@ -16,6 +16,8 @@ const DEFAULTS = {
   pollIntervalSeconds: 300,   // 轮询间隔（秒）
   retry: 3,                   // 请求重试次数
   timeoutMs: 60000,           // 单次请求超时（毫秒）
+  logDir: './logs',            // 运行日志目录
+  errorDir: './errors',        // 结构化错误报告目录
   cookie: '',                 // 全局抖音 Cookie（收藏列表必须）
   watchers: [],               // 轮询监听目标
 };
@@ -34,6 +36,8 @@ function loadConfig() {
   const apiKey = process.env.TIKHUB_API_KEY || userConfig.apiKey || '';
   const merged = { ...DEFAULTS, ...userConfig, apiKey };
   merged.outputDir = path.resolve(ROOT_DIR, merged.outputDir || DEFAULTS.outputDir);
+  merged.logDir = path.resolve(ROOT_DIR, merged.logDir || DEFAULTS.logDir);
+  merged.errorDir = path.resolve(ROOT_DIR, merged.errorDir || DEFAULTS.errorDir);
   return merged;
 }
 

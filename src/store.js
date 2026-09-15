@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { ROOT_DIR } from './config.js';
+import { writeErrorReport } from './logger.js';
 
 /**
  * 本地去重存储：记录已下载的 aweme_id，避免轮询时重复下载。
@@ -30,6 +31,7 @@ export class Store {
     } catch (e) {
       // 存储失败不应中断下载流程
       console.warn('[WARN] 写入去重记录失败:', e.message);
+      writeErrorReport('store-write', e, { file: this.file });
     }
   }
 

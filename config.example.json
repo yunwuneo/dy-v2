@@ -8,6 +8,8 @@
   "pollIntervalSeconds": 300,
   "retry": 3,
   "timeoutMs": 60000,
+  "logDir": "./logs",
+  "errorDir": "./errors",
   "cookie": "",
   "saveMetadata": true,
   "watchers": [

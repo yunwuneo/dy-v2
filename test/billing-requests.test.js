@@ -1,4 +1,4 @@
-import test from 'node:test';
+import test, { after } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -21,6 +21,12 @@ const {
 } = await import('../src/tasks.js');
 const { runWatcherOnce } = await import('../src/poller.js');
 const { config } = await import('../src/config.js');
+const { billingSnapshot } = await import('../src/api-billing.js');
+const { tikhubRequest } = await import('../src/tikhub.js');
+const originalDataDir = config.dataDir;
+const billingTestDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dy-api-billing-test-'));
+config.dataDir = billingTestDir;
+after(() => { config.dataDir = originalDataDir; fs.rmSync(billingTestDir, { recursive: true, force: true }); });
 const { buildTargetPath, sanitize } = await import('../src/downloader.js');
 
 test('image metadata prefers JPEG download URLs over vvic originals', () => {
@@ -271,4 +277,20 @@ test('deterministic App API errors do not trigger a Web fallback', async () => {
   } finally {
     mock.restore();
   }
+});
+
+test('API bill persists initiated attempts and estimates only successful calls', async () => {
+  const endpoint = '/api/v1/douyin/web/test_billing';
+  let calls = 0;
+  const mock = installFetch(() => {
+    calls++;
+    return response(calls === 1 ? { code: 400, message: 'invalid request' } : { code: 200, data: {} });
+  });
+  try {
+    await assert.rejects(() => tikhubRequest(endpoint, { retries: 1 }));
+    await tikhubRequest(endpoint, { retries: 1 });
+    const row = billingSnapshot().endpoints.find(item => item.endpoint === endpoint);
+    assert.deepEqual({ requests: row.requests, succeeded: row.succeeded, failed: row.failed, pending: row.pending, estimatedCostUsd: row.estimatedCostUsd },
+      { requests: 2, succeeded: 1, failed: 1, pending: 0, estimatedCostUsd: 0.001 });
+  } finally { mock.restore(); }
 });

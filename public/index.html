@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light">
   <title>抖音下载器</title>
-  <link rel="stylesheet" href="/styles.css?v=3">
+  <link rel="stylesheet" href="/styles.css?v=6">
 </head>
 <body>
   <header class="topbar">
@@ -14,14 +14,60 @@
       <div><strong>抖音下载器</strong><span>本地控制台</span></div>
     </div>
     <nav class="main-nav" aria-label="主要功能">
-      <button class="nav-tab active" type="button" data-view="download">下载</button>
+      <button class="nav-tab active" type="button" data-view="console">控制台</button>
+      <button class="nav-tab" type="button" data-view="download">下载</button>
       <button class="nav-tab" type="button" data-view="library">已下载</button>
+      <button class="nav-tab" type="button" data-view="watchers">轮询监听</button>
+      <button class="nav-tab" type="button" data-view="billing">API 成本账单</button>
+      <button class="nav-tab" type="button" data-view="settings">设置</button>
     </nav>
     <div class="server-state"><i id="status-dot"></i><span id="status-text">连接中</span></div>
   </header>
 
   <main>
-    <div id="download-view">
+    <div id="console-view">
+      <section class="console-heading">
+        <div><p class="eyebrow">工作概览</p><h1>下载控制台</h1><p class="console-intro">跟踪下载进度，管理任务与本地内容。</p></div>
+        <button id="new-download" class="primary" type="button">新建下载</button>
+      </section>
+      <section id="console-notice" class="notice" role="status" aria-live="polite" hidden></section>
+      <dl class="overview-stats">
+        <div><dt>进行中</dt><dd id="overview-running">0</dd><small id="overview-concurrency">正在读取配置</small></div>
+        <div><dt>等待执行</dt><dd id="overview-queued">0</dd><small>页面关闭后继续下载</small></div>
+        <div><dt>已归档作品</dt><dd id="overview-media">0</dd><small id="overview-size">0 B 本地空间</small></div>
+        <div><dt>需要处理</dt><dd id="overview-failed">0</dd><small>失败、部分完成或中断</small></div>
+      </dl>
+      <div class="console-columns">
+        <section class="console-panel task-panel">
+          <div class="panel-heading"><div><p class="eyebrow">任务管理</p><h2>下载队列</h2></div><label class="sr-only" for="task-filter">任务状态</label><select id="task-filter"><option value="">全部任务</option><option value="running">进行中</option><option value="queued">排队中</option><option value="completed">已完成</option><option value="failed">失败</option><option value="partial">部分完成</option><option value="cancelled">已取消</option><option value="interrupted">已中断</option></select></div>
+          <div id="task-empty" class="task-empty"><span class="empty-icon" aria-hidden="true">↓</span><strong>准备好保存下一份内容</strong><p>新建下载任务后，在这里查看进度。</p></div>
+          <div id="task-list" class="task-list"></div>
+          <button id="tasks-more" class="secondary load-more" type="button" hidden>显示更多任务</button>
+        </section>
+        <aside class="console-aside">
+          <section class="console-panel"><div class="panel-heading"><h2>运行状态</h2><span class="live-label">本地服务</span></div><dl class="runtime-details"><div><dt>运行时间</dt><dd id="runtime-uptime">—</dd></div><div><dt>本次启动 API 请求</dt><dd id="runtime-api">0</dd></div><div><dt>API 成功 / 失败</dt><dd id="runtime-api-results">0 / 0</dd></div><div><dt>保存位置</dt><dd id="runtime-output">—</dd></div></dl></section>
+        </aside>
+      </div>
+      <section class="console-panel log-panel"><div class="panel-heading"><div><p class="eyebrow">实时更新</p><h2>运行日志</h2></div><span class="panel-description">最近 200 条 · 自动更新</span></div><pre id="console-logs" class="console-logs" tabindex="0" aria-label="运行日志">等待任务运行…</pre></section>
+    </div>
+    <div id="billing-view" hidden>
+      <section class="page-hero">
+        <div><p class="eyebrow">API 使用情况</p><h1>API 成本账单</h1><p>按端点记录本应用发起的 TikHub 请求。成本按参考单价估算，实际扣费请以 TikHub 账单为准。</p></div>
+        <button id="billing-refresh" class="secondary" type="button">刷新账单与余额</button>
+      </section>
+      <section id="billing-notice" class="notice" role="status" aria-live="polite" hidden></section>
+      <dl class="billing-summary">
+        <div><dt>累计请求</dt><dd id="billing-requests">0</dd></div>
+        <div><dt>成功 / 失败</dt><dd id="billing-results">0 / 0</dd></div>
+        <div><dt>估算成本</dt><dd id="billing-cost">$0.000</dd></div>
+        <div><dt>当前余额</dt><dd id="billing-balance">—</dd><small id="billing-free-credit">—</small></div>
+      </dl>
+      <p id="billing-note" class="billing-note">从启用此功能后开始统计；成功请求按参考价估算，阶梯折扣、免费额度和价格变化尚未计入。</p>
+      <section class="console-panel billing-panel"><div class="panel-heading"><h2>各端点明细</h2><span class="panel-description">金额单位：USD</span></div>
+        <div class="billing-table-wrap"><table class="billing-table"><thead><tr><th>端点</th><th>请求</th><th>成功</th><th>失败</th><th>参考单价</th><th>估算成本</th></tr></thead><tbody id="billing-rows"><tr><td colspan="6">暂无请求记录</td></tr></tbody></table></div>
+      </section>
+    </div>
+    <div id="download-view" hidden>
     <section class="command-band" aria-labelledby="workspace-title">
       <div class="section-heading">
         <div><p class="eyebrow">下载任务</p><h1 id="workspace-title">查找并保存作品</h1></div>
@@ -91,7 +137,56 @@
         <button id="library-more" class="secondary load-more" type="button" hidden>加载更多</button>
       </section>
     </div>
+
+    <div id="watchers-view" hidden>
+      <section class="page-hero"><div><p class="eyebrow">AUTOMATION / 01</p><h1>轮询监听<span class="hero-dot">.</span></h1><p>定期检查监控目标，发现未下载作品后自动归档。</p></div><button id="add-watcher" class="primary" type="button">＋ 添加目标</button></section>
+      <section id="watchers-notice" class="notice" role="status" aria-live="polite" hidden></section>
+      <section class="poller-panel" aria-label="轮询运行状态">
+        <div class="poller-heading"><div><span id="poller-status" class="poller-status">正在读取状态…</span><p id="poller-detail">—</p></div><div class="poller-controls"><button id="poller-start" class="primary" type="button" disabled>启动监听</button><button id="poller-stop" class="secondary" type="button" disabled>停止监听</button><button id="poller-run" class="secondary" type="button" disabled>立即检查全部</button></div></div>
+        <dl class="poller-times"><div><dt>上次开始</dt><dd id="poller-last-start">—</dd></div><div><dt>上次结束</dt><dd id="poller-last-finish">—</dd></div><div><dt>下次检查</dt><dd id="poller-next">—</dd></div><div><dt>检查间隔</dt><dd id="poller-interval">—</dd></div></dl>
+        <progress id="poller-progress" max="1" value="0" aria-label="本轮目标检查进度"></progress><p id="poller-result" class="poller-result">尚未运行</p>
+        <p id="poller-error" class="poller-error" hidden></p>
+        <p class="poller-hint">每轮完成后等待设定间隔再检查；停止会取消本轮未完成的下载，已完成文件保留。监听启停状态会保存，重启服务后恢复。</p>
+      </section>
+      <div class="section-caption"><span>已保存目标</span><span id="watcher-count">00</span></div>
+      <div id="watcher-list" class="watcher-grid"></div>
+      <div id="watcher-empty" class="feature-empty" hidden><span class="feature-symbol">◎</span><h2>从第一个目标开始</h2><p>添加抖音用户后，可定期监控作品、点赞或收藏。</p><button class="secondary" type="button" data-add-watcher>添加目标</button></div>
+      <p class="restart-footnote">目标保存后自动生效：新目标及参数用于后续检查，暂停或移除正在检查的目标会取消其当前任务。</p>
+    </div>
+
+    <div id="settings-view" hidden>
+      <section class="page-hero"><div><p class="eyebrow">PREFERENCES / 02</p><h1>运行设置<span class="hero-dot">.</span></h1><p>调整连接、下载与本地存储。设置会保存到 config.json。</p></div><span class="hero-index">02 / 02</span></section>
+      <section id="settings-notice" class="notice" role="status" aria-live="polite" hidden></section>
+      <div id="restart-banner" class="restart-banner" hidden><span class="restart-pulse"></span><div><strong>有目录设置等待重启</strong><p id="restart-detail">下载目录和数据目录变更需重启服务，其余设置已热重载。</p></div></div>
+      <form id="settings-form">
+        <section class="settings-section"><div class="settings-section-title"><span>01</span><div><h2>连接与身份</h2><p>控制 API 请求与收藏访问。</p></div></div><div class="settings-fields">
+          <label><span>TikHub API Key <em>后续请求生效</em></span><input name="apiKey" type="password" autocomplete="new-password" placeholder="留空则保持现有密钥"><small id="api-key-status"></small><span class="secret-clear"><input name="clearApiKey" type="checkbox"> 清除配置文件中的密钥</span></label>
+          <label><span>API 地址 <em>后续请求生效</em></span><input name="baseUrl" type="url" required></label>
+          <label><span>下载区域 <em>后续请求生效</em></span><input name="region" required maxlength="8" placeholder="CN"></label>
+          <label><span>全局抖音 Cookie <em>后续检查生效</em></span><input name="cookie" type="password" autocomplete="new-password" placeholder="留空则保持现有 Cookie"><small id="cookie-status"></small><span class="secret-clear"><input name="clearCookie" type="checkbox"> 清除已保存的 Cookie</span></label>
+        </div></section>
+        <section class="settings-section"><div class="settings-section-title"><span>02</span><div><h2>下载与调度</h2><p>设置请求频率及后台任务规模。</p></div></div><div class="settings-fields">
+          <label><span>每页数量 <em>后续请求生效</em></span><input name="count" type="number" min="1" max="200" required></label>
+          <label><span>下载并发 <em>后续任务生效</em></span><input name="downloadConcurrency" type="number" min="1" max="8" required></label>
+          <label><span>任务并发 <em>立即生效</em></span><input name="taskConcurrency" type="number" min="1" max="8" required></label>
+          <label><span>轮询间隔 / 秒 <em>立即重算下次时间</em></span><input name="pollIntervalSeconds" type="number" min="5" required></label>
+          <label><span>请求重试次数 <em>后续请求生效</em></span><input name="retry" type="number" min="0" max="20" required></label>
+          <label><span>请求超时 / 毫秒 <em>后续请求生效</em></span><input name="timeoutMs" type="number" min="1" required></label>
+        </div></section>
+        <section class="settings-section"><div class="settings-section-title"><span>03</span><div><h2>本地存储</h2><p>目录变更不会移动既有文件。</p></div></div><div class="settings-fields">
+          <label class="wide"><span>下载目录 <em>重启生效</em></span><input name="outputDir" required></label>
+          <label><span>数据目录 <em>重启生效</em></span><input name="dataDir" required></label>
+          <label><span>媒体库缓存 / 秒 <em>立即生效</em></span><input name="libraryCacheSeconds" type="number" min="1" required></label>
+          <label><span>日志目录 <em>立即生效</em></span><input name="logDir" required></label>
+          <label><span>错误报告目录 <em>立即生效</em></span><input name="errorDir" required></label>
+          <label class="toggle-field"><input name="saveMetadata" type="checkbox"><span>保存作品元数据 <em>后续写入生效</em></span></label>
+        </div></section>
+        <div class="settings-actions"><p>保存后自动应用；只有下载目录与数据目录需要重启。减少任务并发时，正在运行的任务会正常完成。</p><button class="primary" type="submit">保存设置</button></div>
+      </form>
+    </div>
   </main>
+
+  <dialog id="watcher-dialog" class="watcher-dialog"><form id="watcher-form"><div class="dialog-head"><div><p class="eyebrow">监控目标</p><h2 id="watcher-dialog-title">添加目标</h2></div><button class="icon-button" type="button" data-close-watcher aria-label="关闭">×</button></div><div class="watcher-form-body"><label class="field"><span>用户标识</span><input name="identifier" required maxlength="512" placeholder="抖音号、UID、sec_user_id 或主页链接"></label><label class="field"><span>显示名称（可选）</span><input name="name" maxlength="100" placeholder="留空时优先显示已缓存昵称"></label><label class="secret-clear"><input name="enabled" type="checkbox" checked> 启用此目标的自动检查</label><fieldset><legend>监控内容</legend><label><input type="checkbox" name="types" value="post" checked> 作品</label><label><input type="checkbox" name="types" value="like"> 点赞</label><label><input type="checkbox" name="types" value="collect"> 收藏</label></fieldset><label class="field"><span>每次最多检查</span><input name="limit" type="number" min="1" max="10000" value="20" required></label><label class="field"><span>专用 Cookie（可选）</span><input name="cookie" type="password" autocomplete="new-password" placeholder="留空保持现有 Cookie"><span class="secret-clear"><input name="clearCookie" type="checkbox"> 清除该目标的 Cookie</span></label><p class="form-hint">收藏列表需要 Cookie。目标保存后自动生效；本轮已开始的检查使用原参数。</p></div><div class="dialog-actions"><button class="secondary" type="button" data-close-watcher>取消</button><button class="primary" type="submit">保存目标</button></div></form></dialog>
 
   <dialog id="detail-dialog" class="detail-dialog">
     <div class="dialog-head"><div><p class="eyebrow" id="detail-kind"></p><h2 id="detail-title"></h2></div><button class="icon-button" type="button" data-close-detail aria-label="关闭" title="关闭">×</button></div>
@@ -122,6 +217,6 @@
       <button class="row-action" type="button">查看</button>
     </article>
   </template>
-  <script type="module" src="/app.js?v=3"></script>
+  <script type="module" src="/app.js?v=7"></script>
 </body>
 </html>

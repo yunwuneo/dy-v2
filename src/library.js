@@ -81,7 +81,7 @@ function safeHttpUrl(value) {
   }
 }
 
-function itemFromTarget(root, target, { includeFallbacks = false } = {}) {
+function itemFromTarget(root, target, { includeFallbacks = false, compact = false } = {}) {
   const stat = fs.statSync(target);
   const relative = path.relative(root, target);
   const segments = relative.split(path.sep);
@@ -103,7 +103,7 @@ function itemFromTarget(root, target, { includeFallbacks = false } = {}) {
     user: segments[0] || '未分类',
     type: segments[1] || '未分类',
     awemeId: String(metadata.aweme_id || /_(\d{12,})(?:\.mp4)?$/.exec(target)?.[1] || ''),
-    createdAt: metadata.create_time_iso || (metadata.create_time ? new Date(metadata.create_time * 1000).toISOString() : null),
+    createdAt: metadata.create_time_iso || (Number.isFinite(Number(metadata.create_time)) && Number(metadata.create_time) > 0 && Number(metadata.create_time) < 8640000000000 ? new Date(metadata.create_time * 1000).toISOString() : null),
     downloadedAt: metadata.local?.downloaded_at || modifiedAt,
     size,
     fileCount: files.length,
@@ -115,13 +115,13 @@ function itemFromTarget(root, target, { includeFallbacks = false } = {}) {
     mediaUrl: `/api/library/media?id=${encodeURIComponent(id)}&file=0`,
     thumbnailUrl: isVideo ? '' : `/api/library/media?id=${encodeURIComponent(id)}&file=0`,
     thumbnailFallbackUrl: isVideo ? '' : safeHttpUrl(metadata.cover || metadata.image_urls?.[0]),
-    media: files.map((_, index) => `/api/library/media?id=${encodeURIComponent(id)}&file=${index}`),
-    mediaSupported: isVideo ? [true] : files.map(browserCompatibleImage),
+    media: compact ? undefined : files.map((_, index) => `/api/library/media?id=${encodeURIComponent(id)}&file=${index}`),
+    mediaSupported: isVideo ? [true] : (compact ? files.slice(0, 1) : files).map(browserCompatibleImage),
     fallbackMedia: includeFallbacks && !isVideo ? files.map((_, index) => safeHttpUrl(metadata.image_urls?.[index])) : undefined,
   };
 }
 
-function walk(root, dir, items, counters) {
+function walk(root, dir, items, counters, options) {
   let entries;
   try {
     entries = fs.readdirSync(dir, { withFileTypes: true });
@@ -129,8 +129,8 @@ function walk(root, dir, items, counters) {
     return;
   }
 
-  if (entries.some((entry) => entry.isFile() && entry.name === 'metadata.json')) {
-    const album = itemFromTarget(root, dir);
+  if (dir !== root && entries.some((entry) => entry.isFile() && IMAGE_EXTENSIONS.has(path.extname(entry.name).toLowerCase()))) {
+    const album = itemFromTarget(root, dir, options);
     if (album) {
       items.push(album);
       return;
@@ -140,22 +140,24 @@ function walk(root, dir, items, counters) {
   for (const entry of entries) {
     if (entry.name.startsWith('.') || entry.isSymbolicLink()) continue;
     const target = path.join(dir, entry.name);
-    if (entry.isDirectory()) walk(root, target, items, counters);
-    else if (entry.isFile() && path.extname(entry.name).toLowerCase() === '.mp4') {
-      const video = itemFromTarget(root, target);
-      if (video) items.push(video);
-    } else if (entry.isFile() && path.extname(entry.name).toLowerCase() === '.json' && entry.name !== 'metadata.json') {
-      const mediaPath = target.replace(/\.json$/i, '.mp4');
-      if (!fs.existsSync(mediaPath)) counters.orphanMetadata += 1;
-    }
+    try {
+      if (entry.isDirectory()) walk(root, target, items, counters, options);
+      else if (entry.isFile() && path.extname(entry.name).toLowerCase() === '.mp4') {
+        const video = itemFromTarget(root, target, options);
+        if (video) items.push(video);
+      } else if (entry.isFile() && path.extname(entry.name).toLowerCase() === '.json' && entry.name !== 'metadata.json') {
+        const mediaPath = target.replace(/\.json$/i, '.mp4');
+        if (!fs.existsSync(mediaPath)) counters.orphanMetadata += 1;
+      }
+    } catch { counters.scanErrors++; }
   }
 }
 
-export function listLibrary(root = config.outputDir) {
+export function listLibrary(root = config.outputDir, options = {}) {
   const base = path.resolve(root);
   const items = [];
-  const counters = { orphanMetadata: 0 };
-  if (fs.existsSync(base)) walk(base, base, items, counters);
+  const counters = { orphanMetadata: 0, scanErrors: 0 };
+  if (fs.existsSync(base)) walk(base, base, items, counters, options);
   items.sort((a, b) => String(b.downloadedAt).localeCompare(String(a.downloadedAt)));
   return {
     items,
@@ -165,6 +167,7 @@ export function listLibrary(root = config.outputDir) {
       albums: items.filter((item) => item.kind === 'album').length,
       bytes: items.reduce((sum, item) => sum + item.size, 0),
       orphanMetadata: counters.orphanMetadata,
+      scanErrors: counters.scanErrors,
       users: [...new Set(items.map((item) => item.user))].sort((a, b) => a.localeCompare(b, 'zh-CN')),
       types: [...new Set(items.map((item) => item.type))].sort((a, b) => a.localeCompare(b, 'zh-CN')),
     },
@@ -174,6 +177,8 @@ export function listLibrary(root = config.outputDir) {
 export function getLibraryItem(id, root = config.outputDir) {
   const target = safeTarget(root, id);
   if (!fs.existsSync(target) || fs.lstatSync(target).isSymbolicLink()) throw new LibraryError('媒体不存在', 404);
+  const realRoot = fs.realpathSync(root), realTarget = fs.realpathSync(target);
+  if (realTarget === realRoot || !realTarget.startsWith(`${realRoot}${path.sep}`)) throw new LibraryError('媒体路径越界', 400);
   const item = itemFromTarget(path.resolve(root), target, { includeFallbacks: true });
   if (!item) throw new LibraryError('媒体不存在', 404);
   return { item, target };

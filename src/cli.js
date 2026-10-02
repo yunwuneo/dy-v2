@@ -68,7 +68,15 @@ async function cmdDownload(args) {
 async function cmdServe(args) {
   const { startServer } = await import('./server.js');
   const port = args.flags.port ? parseInt(args.flags.port, 10) : 8787;
-  await startServer(port);
+  const server = startServer(port);
+  let stopping = false;
+  const shutdown = async () => {
+    if (stopping) return;
+    stopping = true;
+    try { await server.shutdown(); } catch (error) { log.error(error.message); process.exitCode = 1; }
+  };
+  process.once('SIGINT', shutdown);
+  process.once('SIGTERM', shutdown);
 }
 
 async function cmdMcp() {

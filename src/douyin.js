@@ -1,6 +1,8 @@
 import { tikhubRequest, TikHubError } from './tikhub.js';
 import { config } from './config.js';
 import { log } from './logger.js';
+import { checkCancelled, sleep } from './execution.js';
+import { rememberUser } from './profile-cache.js';
 
 const WEB = '/api/v1/douyin/web';
 
@@ -49,7 +51,9 @@ export async function getUserInfo(identifier) {
     r = await tikhubRequest(`${WEB}/handler_user_profile_v3`, { query: { uid: id.uid } });
   }
   const data = r?.data;
-  return data?.user ?? data ?? {};
+  const user = data?.user ?? data ?? {};
+  rememberUser(user, [typeof identifier === 'string' ? identifier : '', id.sec_user_id, id.uid, id.unique_id]);
+  return user;
 }
 
 /**
@@ -97,6 +101,7 @@ async function paginate(fetchPage, { limit = Infinity, maxPages = 200, stopAfter
   let hasMore = true;
   let pages = 0;
   while (hasMore && items.length < limit && pages < maxPages) {
+    checkCancelled();
     pages += 1;
     const page = await fetchPage(cursor);
     const list = page?.aweme_list || [];
@@ -135,6 +140,7 @@ export function listPosts(secUserId, { limit = Infinity, filterType = 0, cookie 
     try {
       return await fetchPageApp(cursor);
     } catch (e) {
+      checkCancelled();
       if (!canFallbackToWeb(e)) throw e;
       log.warn(`App V3 作品接口失败（${e.message}），降级 Web 版重试`);
       return fetchPageWeb(cursor);
@@ -161,6 +167,7 @@ export function listLikes(secUserId, { limit = Infinity, cookie = '', stopAfterP
     try {
       return await fetchPageApp(cursor);
     } catch (e) {
+      checkCancelled();
       if (!canFallbackToWeb(e)) throw e;
       log.warn(`App V3 点赞接口失败（${e.message}），降级 Web 版重试`);
       return fetchPageWeb(cursor);
@@ -194,9 +201,10 @@ export async function getVideoDownloadUrl(awemeId) {
       });
       return r?.data ?? {};
     } catch (e) {
+      checkCancelled();
       lastErr = e;
       if (!isTransientTikHubError(e)) throw e;
-      if (attempt < 2) await new Promise((r) => setTimeout(r, 1200 * (attempt + 1)));
+      if (attempt < 2) await sleep(1200 * (attempt + 1));
     }
   }
   throw lastErr;

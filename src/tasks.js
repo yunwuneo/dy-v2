@@ -18,6 +18,8 @@ import {
 } from './douyin.js';
 import { downloadToFile, downloadImageToFile, detectMediaExtension, writeJsonFile, buildTargetPath } from './downloader.js';
 import { Store } from './store.js';
+import { cachedName } from './profile-cache.js';
+import { checkCancelled, mapConcurrent, withKeyLock } from './execution.js';
 
 export const TYPE_LABEL = { post: '作品', like: '点赞', collect: '收藏' };
 export const VALID_TYPES = Object.keys(TYPE_LABEL);
@@ -146,14 +148,52 @@ function summarizeVideos(list) {
   });
 }
 
-function embeddedVideoUrl(item) {
+function embeddedVideoUrls(item) {
   const aweme = item?.aweme ?? item;
   const candidates = [
     ...(aweme?.video?.play_addr?.url_list || []),
     ...(aweme?.video?.download_addr?.url_list || []),
     ...(aweme?.video?.bit_rate || []).flatMap((rate) => rate?.play_addr?.url_list || []),
   ];
-  return candidates.find((url) => typeof url === 'string' && /^https?:\/\//i.test(url)) || '';
+  const hosts = new Set();
+  return candidates.filter((url) => {
+    if (typeof url !== 'string' || !/^https?:\/\//i.test(url)) return false;
+    let host;
+    try { host = new URL(url).host; } catch { return false; }
+    if (hosts.has(host)) return false;
+    hosts.add(host);
+    return true;
+  }).slice(0, 8);
+}
+
+function embeddedVideoUrl(item) { return embeddedVideoUrls(item)[0] || ''; }
+
+export async function downloadVideoWithFallback(info, item, file, label) {
+  const candidates = [...new Set([
+    info?.original_video_url, info?.video_url, info?.url, ...embeddedVideoUrls(item),
+  ].filter((url) => typeof url === 'string' && /^https?:\/\//i.test(url)))];
+  if (!candidates.length) throw new Error('未获取到可用视频地址');
+  let lastError;
+  for (let index = 0; index < candidates.length; index++) {
+    try {
+      const size = await downloadToFile(candidates[index], file, {
+        partialSuffix: index ? `.fallback-${index}.part` : '.part',
+        retries: index ? 2 : undefined,
+      });
+      if (index) {
+        log.warn(`[${label}] 高清 CDN 下载失败，已改用备用播放地址`);
+      }
+      for (let prior = 0; prior < index; prior++) {
+        fs.rmSync(`${file}${prior ? `.fallback-${prior}.part` : '.part'}`, { force: true });
+      }
+      return { size, url: candidates[index], fallback: index > 0 };
+    } catch (error) {
+      checkCancelled();
+      lastError = error;
+      if (index + 1 < candidates.length) log.warn(`[${label}] 视频地址 ${index + 1} 失败，尝试备用地址: ${error.message}`);
+    }
+  }
+  throw lastError;
 }
 
 /** 拉取一次可供展示或下载复用的原始批次。 */
@@ -218,7 +258,7 @@ export async function prepareVideoBatch({
     ? await listPosts(context.secUserId, { limit, cookie: ck, stopAfterPage: boundary.stopAfterPage })
     : await listLikes(context.secUserId, { limit, cookie: ck, stopAfterPage: boundary.stopAfterPage });
   const info = context.info || {};
-  const userName = knownUserName || info?.nickname || info?.user?.nickname || context.secUserId;
+  const userName = knownUserName || info?.nickname || info?.user?.nickname || cachedName(context.secUserId) || context.secUserId;
   return {
     type: t,
     label,
@@ -260,8 +300,9 @@ async function downloadAlbum({ awemeId, desc, userName, typeLabel, imageUrls, ra
   }
   const files = [];
   for (let i = 0; i < imageUrls.length; i++) {
+    checkCancelled();
     const url = imageUrls[i];
-    if (!url) continue;
+    if (!url) throw new Error('图集包含缺失的图片地址');
     const prefix = `img_${String(i + 1).padStart(2, '0')}`;
     const existing = entries.find((entry) => entry.isFile() && entry.name.startsWith(`${prefix}.`) && !entry.name.endsWith('.part'));
     if (existing) {
@@ -303,6 +344,7 @@ export async function downloadSingle(identifier) {
   try {
     detail = await getSingleVideo(awemeId);
   } catch (error) {
+    checkCancelled();
     if (!isTransientTikHubError(error)) throw error;
   }
   const aweme = detail?.aweme_detail ?? detail?.aweme ?? detail ?? {};
@@ -354,14 +396,15 @@ export async function downloadSingle(identifier) {
     info = await getVideoDownloadUrl(awemeId);
     url = info?.original_video_url || info?.video_url || info?.url || '';
   } catch (error) {
+    checkCancelled();
     url = embeddedVideoUrl(aweme);
     if (!url) throw error;
     log.warn(`[单视频] ${awemeId} 高清地址接口失败，改用详情内播放地址: ${error.message}`);
   }
   if (!url) throw new Error(`未获取到下载地址: ${awemeId}`);
-  const size = await downloadToFile(url, file);
-  saveMetadata(aweme, { file }, { file, size, downloaded_at: new Date().toISOString() });
-  return { aweme_id: awemeId, kind: 'video', desc, file, dir, size, url };
+  const media = await downloadVideoWithFallback(info && Object.keys(info).length ? info : { video_url: url }, aweme, file, '单视频');
+  saveMetadata(aweme, { file }, { file, size: media.size, fallback: media.fallback, downloaded_at: new Date().toISOString() });
+  return { aweme_id: awemeId, kind: 'video', desc, file, dir, size: media.size, url: media.url, fallback: media.fallback };
 }
 
 /** 下载某用户某类型的全部（或前 N 个）作品，自动区分视频与图集 */
@@ -375,6 +418,8 @@ export async function downloadVideos({
   secUserId = '',
   userName = '',
   store: providedStore = null,
+  onProgress = () => {},
+  concurrency = config.downloadConcurrency,
 } = {}) {
   const store = providedStore || new Store();
   let batch;
@@ -413,72 +458,92 @@ export async function downloadVideos({
     failed: 0,
     stopped_at_known: Boolean(batch.stoppedAtKnown),
     files: [],
+    errors: [],
+    completed: 0,
+    active: 0,
   };
 
-  for (const item of list) {
-    const meta = awemeMeta(item);
-    if (!meta.awemeId) continue;
+  onProgress({ ...stats });
+  await mapConcurrent(list, concurrency, async (item) => {
+    const itemId = awemeMeta(item).awemeId;
+    if (!itemId) { stats.completed++; onProgress({ ...stats }); return; }
+    return withKeyLock(buildTargetPath(userName, label, itemId, awemeMeta(item).desc).file, async () => {
+      checkCancelled();
+      stats.active++;
+      onProgress({ ...stats });
+      try {
+        const meta = awemeMeta(item);
+        if (!meta.awemeId) return;
 
-    // 已下载在案：增量跳过；若发现缺少元数据 JSON 则顺带补写（存量回填）
-    if (store.has(userKey, t, meta.awemeId)) {
-      if (backfillMetadata(item, userName, label)) stats.metadata_backfilled += 1;
-      else stats.skipped += 1;
-      continue;
-    }
+        // 已下载在案：增量跳过；若发现缺少元数据 JSON 则顺带补写（存量回填）
+        if (store.has(userKey, t, meta.awemeId)) {
+          if (backfillMetadata(item, userName, label)) stats.metadata_backfilled += 1;
+          else stats.skipped += 1;
+          return;
+        }
 
-    try {
-      if (meta.isImagePost) {
-        // ── 图集/图片帖：直接下载列表里的图片地址，不产生额外 API 费用 ──
-        if (meta.imageUrls.length === 0) throw new Error('图集无可用图片地址');
+        try {
+          if (meta.isImagePost) {
+            // ── 图集/图片帖：直接下载列表里的图片地址，不产生额外 API 费用 ──
+            if (meta.imageUrls.length === 0) throw new Error('图集无可用图片地址');
 
-        const album = await downloadAlbum({
-          awemeId: meta.awemeId,
-          desc: meta.desc,
-          userName,
-          typeLabel: label,
-          imageUrls: meta.imageUrls,
-          rawItem: item,
-        });
+            const album = await downloadAlbum({
+              awemeId: meta.awemeId,
+              desc: meta.desc,
+              userName,
+              typeLabel: label,
+              imageUrls: meta.imageUrls,
+              rawItem: item,
+            });
         store.mark(userKey, t, meta.awemeId);
         stats.downloaded += 1;
         const totalSize = album.files.reduce((s, f) => s + f.size, 0);
         stats.files.push({ aweme_id: meta.awemeId, kind: 'album', desc: meta.desc, dir: album.dir, count: album.files.length, size: totalSize });
         log.ok(`[图集] ${meta.desc || meta.awemeId}  (${album.files.length} 张图片)`);
-        continue;
+        return;
       }
 
       // ── 普通视频 ──
+      const { file, dir } = buildTargetPath(userName, label, meta.awemeId, meta.desc);
+      if (fs.existsSync(file) && fs.statSync(file).size > 0) {
+        saveMetadata(item, { file }, { file, size: fs.statSync(file).size, downloaded_at: fs.statSync(file).mtime.toISOString() });
+        store.mark(userKey, t, meta.awemeId);
+        stats.skipped += 1;
+        return;
+      }
       let info = {};
       let url = '';
       try {
         info = await getVideoDownloadUrl(meta.awemeId);
         url = info?.original_video_url || info?.video_url || info?.url || '';
       } catch (error) {
+        checkCancelled();
         url = embeddedVideoUrl(item);
         if (!url) throw error;
         log.warn(`[${label}] ${meta.awemeId} 高清地址接口失败，改用列表内播放地址: ${error.message}`);
       }
-      if (!url) { stats.failed += 1; log.warn(`[${label}] ${meta.awemeId} 无下载地址`); continue; }
+      if (!url) throw new Error(`未获取到下载地址: ${meta.awemeId}`);
 
-      const { file, dir } = buildTargetPath(userName, label, meta.awemeId, meta.desc);
-      if (fs.existsSync(file)) {
-        saveMetadata(item, { file }, { file, size: fs.statSync(file).size, downloaded_at: fs.statSync(file).mtime.toISOString() });
-        store.mark(userKey, t, meta.awemeId);
-        stats.skipped += 1;
-        continue;
-      }
-      const size = await downloadToFile(url, file);
-      saveMetadata(item, { file }, { file, size, downloaded_at: new Date().toISOString() });
+      const media = await downloadVideoWithFallback(info && Object.keys(info).length ? info : { video_url: url }, item, file, label);
+      const size = media.size;
+      saveMetadata(item, { file }, { file, size, fallback: media.fallback, downloaded_at: new Date().toISOString() });
       store.mark(userKey, t, meta.awemeId);
       stats.downloaded += 1;
       stats.files.push({ aweme_id: meta.awemeId, kind: 'video', desc: meta.desc, file, size });
       log.ok(`[视频] ${meta.desc || meta.awemeId}  (${(size / 1024 / 1024).toFixed(2)} MB)`);
     } catch (e) {
+      checkCancelled();
+      if (stats.errors.length < 20) stats.errors.push({ awemeId: meta.awemeId, message: e.message });
       stats.failed += 1;
       const report = writeErrorReport('item-download', e, { label, awemeId: meta.awemeId, desc: meta.desc, userName, type: t });
       log.error(`[${label}] ${meta.awemeId} 下载失败: ${e.message}${report ? `（详情: ${report}）` : ''}`);
     }
-  }
-
+    } finally {
+      stats.active--;
+      stats.completed++;
+      onProgress({ ...stats });
+    }
+    });
+  });
   return stats;
 }

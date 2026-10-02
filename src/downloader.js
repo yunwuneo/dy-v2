@@ -1,16 +1,19 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { Readable } from 'node:stream';
+import { Readable, Transform } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { config } from './config.js';
 import { log, writeErrorReport } from './logger.js';
+import { checkCancelled, executionSignal, fetchWithIdleTimeout, sleep } from './execution.js';
 
 /** 清理文件名中的非法字符 */
 export function sanitize(name, maxBytes = 80) {
   let s = String(name ?? '')
     .replace(/[\\/:*?"<>|\u0000-\u001f]/g, '_')
     .replace(/\s+/g, ' ')
-    .trim();
+    .trim()
+    .replace(/[. ]+$/g, '');
+  if (/^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(s)) s = `_${s}`;
   while (Buffer.byteLength(s, 'utf8') > maxBytes) s = Array.from(s).slice(0, -1).join('');
   return s || 'untitled';
 }
@@ -19,7 +22,7 @@ export function sanitize(name, maxBytes = 80) {
 export function buildTargetPath(userName, typeLabel, awemeId, desc) {
   const base = config.outputDir;
   const dir = path.join(base, sanitize(userName, 80), typeLabel ? sanitize(typeLabel, 40) : '');
-  const filename = `${sanitize(desc, 100)}_${String(awemeId)}.mp4`;
+  const filename = `${sanitize(desc, 100)}_${sanitize(awemeId, 80)}.mp4`;
   return { dir, file: path.join(dir, filename) };
 }
 
@@ -61,84 +64,113 @@ export function writeJsonFile(destPath, data) {
   }
 }
 
-/** 将远程视频流式写入本地文件，返回文件字节数 */
-export async function downloadToFile(url, destPath, { timeoutMs = 180000, accept = '*/*' } = {}) {
-  let res;
-  try {
-    res = await fetch(url, {
-    redirect: 'follow',
-    headers: {
-      'User-Agent':
-        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
-      Referer: 'https://www.douyin.com/',
-      Accept: accept,
-    },
-    signal: AbortSignal.timeout(timeoutMs),
-    });
-  } catch (e) {
-    writeErrorReport('download-request', e, { url, destPath, timeoutMs });
-    throw new Error(`媒体请求失败: ${e.message}`);
-  }
-
-  if (!res.ok || !res.body) {
-    const error = new Error(`下载失败 HTTP ${res.status}`);
-    writeErrorReport('download-http', error, { url, destPath, status: res.status, headers: Object.fromEntries(res.headers) });
-    throw error;
-  }
-
-  fs.mkdirSync(path.dirname(destPath), { recursive: true });
-  const tmp = `${destPath}.part`;
-  try {
-    await pipeline(Readable.fromWeb(res.body), fs.createWriteStream(tmp));
-    fs.renameSync(tmp, destPath);
-  } catch (e) {
-    try { fs.rmSync(tmp, { force: true }); } catch {}
-    writeErrorReport('download-write', e, { url, destPath, tmp });
-    throw e;
-  }
-  return fs.statSync(destPath).size;
+function partialSize(tmp) {
+  try { return fs.statSync(tmp).size; }
+  catch (error) { if (error.code === 'ENOENT') return 0; throw error; }
 }
 
-/** 下载图片到临时文件，按实际格式决定最终扩展名。 */
-export async function downloadImageToFile(url, albumDir, index, { timeoutMs = 180000, accept = 'image/jpeg,image/png,image/webp,image/avif,image/heic' } = {}) {
-  let res;
-  try {
-    res = await fetch(url, {
-      redirect: 'follow',
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
-        Referer: 'https://www.douyin.com/',
-        Accept: accept,
-      },
-      signal: AbortSignal.timeout(timeoutMs),
-    });
-  } catch (e) {
-    writeErrorReport('download-request', e, { url, albumDir, index, timeoutMs });
-    throw new Error(`媒体请求失败: ${e.message}`);
+/** Retry stalled CDN transfers from the last saved byte. */
+async function downloadMedia(url, tmp, { timeoutMs, accept, retries }) {
+  const attempts = Math.max(1, Math.min(5, Number(retries ?? config.retry)));
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    let request;
+    try {
+      checkCancelled();
+      const offset = partialSize(tmp);
+      request = await fetchWithIdleTimeout(url, {
+        redirect: 'follow',
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36',
+          Referer: 'https://www.douyin.com/', Accept: accept,
+          'Accept-Encoding': 'identity',
+          ...(offset ? { Range: `bytes=${offset}-` } : {}),
+        },
+      }, timeoutMs);
+      const res = request.response;
+      if (offset && res.status === 416) {
+        const total = Number(/^bytes \*\/(\d+)$/.exec(res.headers.get('content-range') || '')?.[1]);
+        await res.body?.cancel();
+        if (total === offset) return res.headers.get('content-type');
+        fs.rmSync(tmp, { force: true });
+        throw new Error('CDN 拒绝续传，重新下载');
+      }
+      if (![200, 206].includes(res.status) || !res.body) {
+        await res.body?.cancel();
+        const error = new Error(`下载失败 HTTP ${res.status}`);
+        error.retryable = res.status === 408 || res.status === 429 || res.status >= 500;
+        throw error;
+      }
+      const range = res.status === 206
+        ? /^bytes (\d+)-(\d+)\/(\d+|\*)$/.exec(res.headers.get('content-range') || '')
+        : null;
+      if (res.status === 206 && (!range || Number(range[1]) !== offset)) {
+        await res.body.cancel();
+        fs.rmSync(tmp, { force: true });
+        throw new Error('CDN 返回的续传范围不匹配，重新下载');
+      }
+      const append = offset > 0 && res.status === 206;
+      const contentLength = Number(res.headers.get('content-length')) || null;
+      const expected = range && range[3] !== '*' ? Number(range[3])
+        : contentLength === null ? null : (append ? offset + contentLength : contentLength);
+      fs.mkdirSync(path.dirname(tmp), { recursive: true });
+      const heartbeat = new Transform({ transform(chunk, _encoding, callback) {
+        if (chunk.length) request.touch();
+        callback(null, chunk);
+      } });
+      const output = fs.createWriteStream(tmp, { flags: append ? 'a' : 'w' });
+      try {
+        await Promise.race([pipeline(Readable.fromWeb(res.body), heartbeat, output, { signal: request.signal }), request.timeout]);
+      } catch (error) {
+        output.destroy(error);
+        throw error;
+      }
+      const size = partialSize(tmp);
+      if (!size) throw new Error('媒体响应为空');
+      if (expected !== null && size !== expected) throw new Error(`媒体传输不完整：${size}/${expected} 字节`);
+      return res.headers.get('content-type');
+    } catch (error) {
+      if (executionSignal()?.aborted) {
+        fs.rmSync(tmp, { force: true });
+        checkCancelled();
+      }
+      if (error.retryable === false || attempt === attempts) {
+        writeErrorReport('download-request', error, { url, tmp, attempt, savedBytes: partialSize(tmp) });
+        throw error;
+      }
+      log.warn(`媒体下载重试 ${attempt}/${attempts}，已保存 ${partialSize(tmp)} 字节: ${error.message}`);
+      await sleep(300 * attempt);
+    } finally { request?.release(); }
   }
-  if (!res.ok || !res.body) {
-    const error = new Error(`下载失败 HTTP ${res.status}`);
-    writeErrorReport('download-http', error, { url, albumDir, index, status: res.status, headers: Object.fromEntries(res.headers) });
+}
+
+/** Stream to a temporary file; only publish complete downloads. */
+export async function downloadToFile(url, destPath, { timeoutMs = config.timeoutMs, accept = '*/*', partialSuffix = '.part', retries } = {}) {
+  const tmp = `${destPath}${partialSuffix}`;
+  try {
+    await downloadMedia(url, tmp, { timeoutMs, accept, retries });
+    checkCancelled();
+    fs.renameSync(tmp, destPath);
+    return fs.statSync(destPath).size;
+  } catch (error) {
+    if (executionSignal()?.aborted) fs.rmSync(tmp, { force: true });
     throw error;
   }
-  fs.mkdirSync(albumDir, { recursive: true });
+}
+
+export async function downloadImageToFile(url, albumDir, index, { timeoutMs = config.timeoutMs, accept = 'image/jpeg,image/png,image/webp,image/avif,image/heic' } = {}) {
   const tmp = path.join(albumDir, `.img_${String(index).padStart(2, '0')}.part`);
   try {
-    await pipeline(Readable.fromWeb(res.body), fs.createWriteStream(tmp));
+    const contentType = await downloadMedia(url, tmp, { timeoutMs, accept });
+    checkCancelled();
     const header = Buffer.alloc(32);
     const fd = fs.openSync(tmp, 'r');
     try { fs.readSync(fd, header, 0, header.length, 0); } finally { fs.closeSync(fd); }
-    const ext = detectMediaExtension(header, res.headers.get('content-type'), url) || '.jpg';
+    const ext = detectMediaExtension(header, contentType, url) || '.jpg';
     const file = path.join(albumDir, `img_${String(index).padStart(2, '0')}${ext}`);
     fs.renameSync(tmp, file);
     return { file, size: fs.statSync(file).size, extension: ext };
-  } catch (e) {
-    try { fs.rmSync(tmp, { force: true }); } catch {}
-    writeErrorReport('download-write', e, { url, albumDir, index, tmp });
-    throw e;
-  }
+  } finally { fs.rmSync(tmp, { force: true }); }
 }
-
 /** 并发下载器（简单实现，带并发上限） */
 export async function downloadAll(jobs, concurrency = config.downloadConcurrency) {
   const results = [];

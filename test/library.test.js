@@ -71,7 +71,7 @@ test('removes an aweme id from all download records', () => {
   }));
   const store = new Store(file);
   assert.equal(store.removeAweme('target'), true);
-  const saved = JSON.parse(fs.readFileSync(file, 'utf8'));
+  const saved = new Store(file).data;
   assert.equal(saved.userA.post.target, undefined);
   assert.equal(saved.userB.like.target, undefined);
   assert.equal(saved.userA.post.keep, 2);

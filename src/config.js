@@ -33,6 +33,22 @@ const DEFAULTS = {
   libraryCacheSeconds: 30,
   pollIntervalSeconds: 300,   // 轮询间隔（秒）
   pollerEnabled: false,       // Web 轮询启停状态
+  analysisAuto: false,        // 新下载视频自动加入分析队列
+  analysisEnabled: false,     // 分析进程启停，重启后恢复
+  analysisClient: 'ollama',
+  analysisUrl: 'http://127.0.0.1:11434',
+  analysisModel: 'llama3.2-vision',
+  analysisPython: 'python',
+  analysisApiKey: '',
+  analysisMaxFrames: 12,
+  analysisWhisperModel: 'base',
+  analysisAudio: true,
+  analysisLanguage: 'auto',
+  analysisAudioProvider: 'local',
+  analysisAudioUrl: '',
+  analysisAudioModel: '',
+  analysisAudioApiKey: '',
+  analysisTimeoutSeconds: 1800,
   retry: 3,                   // 请求重试次数
   timeoutMs: 60000,           // 单次请求超时（毫秒）
   logDir: './logs',            // 运行日志目录
@@ -45,6 +61,10 @@ const DEFAULTS = {
 export const configPath = path.resolve(process.env.DOUYIN_CONFIG || path.join(ROOT_DIR, 'config.json'));
 
 export const SETTINGS = {
+  analysisAuto: 'boolean', analysisEnabled: 'boolean', analysisClient: 'analysisClient',
+  analysisUrl: 'string', analysisModel: 'string', analysisPython: 'string',
+  analysisMaxFrames: 'count', analysisWhisperModel: 'string', analysisAudio: 'boolean', analysisTimeoutSeconds: 'positive',
+  analysisLanguage: 'language', analysisAudioProvider: 'audioProvider', analysisAudioUrl: 'optionalUrl', analysisAudioModel: 'optionalString',
   baseUrl: 'string', region: 'region', outputDir: 'string', dataDir: 'string',
   logDir: 'string', errorDir: 'string', count: 'count',
   downloadConcurrency: 'concurrency', taskConcurrency: 'concurrency',
@@ -59,11 +79,34 @@ const listeners = new Set();
 export function validateField(key, value) {
   const kind = SETTINGS[key];
   if (!kind) throw new Error(`未知设置项: ${key}`);
+  if (kind === 'language') {
+    const languages = 'auto af am ar as az ba be bg bn bo br bs ca cs cy da de el en es et eu fa fi fo fr gl gu ha haw he hi hr ht hu hy id is it ja jw ka kk km kn ko la lb ln lo lt lv mg mi mk ml mn mr ms mt my ne nl nn no oc pa pl ps pt ro ru sa sd si sk sl sn so sq sr su sv sw ta te tg th tk tl tr tt uk ur uz vi yi yo zh yue'.split(' ');
+    if (!languages.includes(value)) throw new Error('转录语言无效，请选择 auto 或支持的语言代码（如 zh、en）');
+    return value;
+  }
+  if (kind === 'audioProvider') {
+    if (!['local', 'cloud'].includes(value)) throw new Error('语音转录方式必须是 local 或 cloud');
+    return value;
+  }
+  if (kind === 'optionalUrl' || kind === 'optionalString') {
+    if (typeof value !== 'string' || value.length > 1000) throw new Error(`${key} 格式无效`);
+    if (kind === 'optionalUrl' && value.trim()) validateField('analysisUrl', value);
+    return value.trim();
+  }
+  if (kind === 'analysisClient') {
+    if (!['ollama', 'openai_api'].includes(value)) throw new Error('分析服务类型无效');
+    return value;
+  }
   if (kind === 'boolean') { if (typeof value !== 'boolean') throw new Error(`${key} 必须是布尔值`); return value; }
   if (kind === 'string' || kind === 'region') {
     if (typeof value !== 'string' || !value.trim() || value.length > 1000) throw new Error(`${key} 不能为空或过长`);
     if (kind === 'region' && !/^[A-Za-z]{2,8}$/.test(value)) throw new Error('region 格式无效');
     if (key === 'baseUrl' && !/^https:\/\//i.test(value)) throw new Error('baseUrl 必须是 HTTPS 地址');
+    if (key === 'analysisUrl') {
+      let url;
+      try { url = new URL(value); } catch { throw new Error('分析 URL 无效'); }
+      if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash) throw new Error('分析 URL 必须是无凭据、无查询参数的 HTTP(S) 地址');
+    }
     return value.trim();
   }
   if (!Number.isInteger(value) || value < 0 || value > 86400000) throw new Error(`${key} 必须是有效整数`);
@@ -96,6 +139,10 @@ export function normalizeWatchers(input) {
   });
 }
 
+export function validateAnalysisConfig(value) {
+  if (value.analysisAudio && value.analysisAudioProvider === 'cloud' && (!value.analysisAudioUrl || !value.analysisAudioModel)) throw new Error('使用云端语音转录时，请填写云端 URL 和语音模型');
+}
+
 function loadConfig() {
   let userConfig = {};
   if (fs.existsSync(configPath)) {
@@ -109,13 +156,14 @@ function loadConfig() {
   const apiKey = process.env.TIKHUB_API_KEY || userConfig.apiKey || '';
   const merged = { ...DEFAULTS, ...userConfig, apiKey };
   for (const key of Object.keys(SETTINGS)) merged[key] = validateField(key, merged[key]);
-  for (const key of ['apiKey', 'cookie']) if (typeof merged[key] !== 'string' || merged[key].length > 10000) throw new Error(`${key} 格式无效`);
+  for (const key of ['apiKey', 'cookie', 'analysisApiKey', 'analysisAudioApiKey']) if (typeof merged[key] !== 'string' || merged[key].length > 10000) throw new Error(`${key} 格式无效`);
+  validateAnalysisConfig(merged);
   merged.watchers = normalizeWatchers(merged.watchers);
   merged.outputDir = path.resolve(ROOT_DIR, merged.outputDir || DEFAULTS.outputDir);
   merged.logDir = path.resolve(ROOT_DIR, merged.logDir || DEFAULTS.logDir);
   merged.errorDir = path.resolve(ROOT_DIR, merged.errorDir || DEFAULTS.errorDir);
   merged.dataDir = path.resolve(ROOT_DIR, merged.dataDir || DEFAULTS.dataDir);
-  for (const secret of [merged.apiKey, merged.cookie, ...merged.watchers.map(w => w.cookie)].filter(Boolean)) configSecrets.add(secret);
+  for (const secret of [merged.apiKey, merged.cookie, merged.analysisApiKey, merged.analysisAudioApiKey, ...merged.watchers.map(w => w.cookie)].filter(Boolean)) configSecrets.add(secret);
   return merged;
 }
 
@@ -127,7 +175,7 @@ export function reloadConfig() {
   try {
     const next = loadConfig();
     const changed = [];
-    for (const key of [...Object.keys(SETTINGS), 'apiKey', 'cookie', 'watchers']) {
+    for (const key of [...Object.keys(SETTINGS), 'apiKey', 'cookie', 'analysisApiKey', 'analysisAudioApiKey', 'watchers']) {
       if (!RESTART_FIELDS.includes(key) && JSON.stringify(next[key]) !== JSON.stringify(config[key])) {
         config[key] = next[key]; changed.push(key);
       }

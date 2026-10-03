@@ -8,6 +8,8 @@ import { log, writeErrorReport, recentLogs, redact } from './logger.js';
 import { JobManager } from './jobs.js';
 import { PollingManager } from './web-poller.js';
 import { LibraryIndex } from './library-index.js';
+import { AnalysisManager } from './analysis.js';
+import { onVideoDownloaded } from './download-events.js';
 import { apiMetrics, tikhubRequest } from './tikhub.js';
 import { billingSnapshot } from './api-billing.js';
 import { acquireFileLock } from './persistence.js';
@@ -169,7 +171,7 @@ async function readBody(req) {
  *   GET  /api/library/media?id=&file=0
  *   DELETE /api/library/item?id=
  */
-async function handle(req, res, { jobs, library, poller, startedAt }) {
+async function handle(req, res, { jobs, library, poller, analysis, startedAt }) {
   const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
   const path = url.pathname;
   const q = url.searchParams;
@@ -182,6 +184,28 @@ async function handle(req, res, { jobs, library, poller, startedAt }) {
     }
 
     if (path === '/health') return sendJson(res, 200, { status: 'ok', time: Date.now() });
+
+    if (method === 'GET' && path === '/api/analysis') {
+      const offset = Number(q.get('offset') || 0);
+      if (!Number.isSafeInteger(offset) || offset < 0) throw new HttpError('offset 必须是非负整数');
+      return sendJson(res, 200, { data: analysis.snapshot({ offset, limit: parseLimit(q.get('limit'), 30), status: q.get('status') || '' }) });
+    }
+    if (method === 'POST' && path === '/api/analysis/queue') {
+      const body = await readBody(req);
+      if (!body || typeof body !== 'object' || Array.isArray(body)) throw new HttpError('分析请求格式无效');
+      return sendJson(res, 202, { data: await analysis.enqueue(body) });
+    }
+    if (method === 'POST' && ['/api/analysis/start', '/api/analysis/stop'].includes(path)) {
+      const enabled = path.endsWith('/start');
+      try { saveSettings({ fields: { analysisEnabled: enabled } }); }
+      finally { if (!enabled) analysis.stop(); }
+      analysis.configure();
+      return sendJson(res, 202, { data: analysis.snapshot() });
+    }
+    if (method === 'POST' && path === '/api/analysis/cancel') {
+      analysis.cancel((await readBody(req)).id);
+      return sendJson(res, 200, { data: analysis.snapshot() });
+    }
 
     if (method === 'GET' && path === '/api/billing') return sendJson(res, 200, { data: billingSnapshot() });
     if (method === 'GET' && path === '/api/billing/balance') {
@@ -265,7 +289,7 @@ async function handle(req, res, { jobs, library, poller, startedAt }) {
       const id = q.get('id');
       if (!id) return sendJson(res, 400, { error: '缺少媒体 ID' });
       const item = getLibraryItem(id).item;
-      return sendJson(res, 200, { data: { ...item, displayUser: cachedName(item.user) || item.author || item.user } });
+      return sendJson(res, 200, { data: { ...item, analysis: analysis.get(id), displayUser: cachedName(item.user) || item.author || item.user } });
     }
 
     if (['GET', 'HEAD'].includes(method) && path === '/api/library/media') {
@@ -277,6 +301,8 @@ async function handle(req, res, { jobs, library, poller, startedAt }) {
     if (method === 'DELETE' && path === '/api/library/item') {
       const id = q.get('id');
       if (!id) return sendJson(res, 400, { error: '缺少媒体 ID' });
+      getLibraryItem(id); // Validate containment before mutating analysis state.
+      await analysis.remove(id);
       const item = deleteLibraryItem(id);
       const storeUpdated = item.awemeId ? new Store().removeAweme(item.awemeId) : false;
       library.invalidate();
@@ -371,17 +397,21 @@ export function startServer(port = 8787, host = '127.0.0.1', options = {}) {
     try { pid = fs.readFileSync(path.join(config.dataDir, 'server.lock'), 'utf8').trim(); } catch { /* lock changed */ }
     throw new Error(`Web 服务已在运行${/^\d+$/.test(pid) ? `（PID ${pid}）` : ''}。请先停止旧服务，再运行 npm run serve。`);
   }
-  let library, jobs, poller;
+  let library, jobs, poller, analysis;
   try {
     library = options.library || new LibraryIndex();
+    analysis = options.analysis || new AnalysisManager({ library });
+    library.analysisSummary = id => analysis.summary(id);
     jobs = options.jobs || new JobManager({ onChange: () => library.invalidate() });
     poller = options.poller || new PollingManager({ jobs });
   } catch (error) { release(); throw error; }
-  const services = { library, jobs, poller, startedAt: Date.now() };
+  const services = { library, jobs, poller, analysis, startedAt: Date.now() };
+  const unsubscribeDownloads = onVideoDownloaded(file => analysis.downloaded(file));
   const applyConfig = changed => {
     if (changed.includes('taskConcurrency')) jobs.setConcurrency(config.taskConcurrency);
     if (changed.includes('libraryCacheSeconds')) { library.ttlMs = config.libraryCacheSeconds * 1000; library.invalidate(); }
     if (changed.some(key => ['baseUrl', 'apiKey', 'cookie', 'region', 'count'].includes(key))) lookupCache.clear();
+    if (changed.includes('analysisEnabled')) analysis.configure();
     try { poller.configure(); } catch (error) { poller.lastError = redact(error.message); log.error(`轮询配置生效失败: ${poller.lastError}`); }
   };
   const unsubscribe = subscribeConfig(applyConfig);
@@ -390,8 +420,8 @@ export function startServer(port = 8787, host = '127.0.0.1', options = {}) {
   server.services = services;
   let cleanupPromise;
   const cleanup = () => cleanupPromise ||= (async () => {
-    unsubscribe(); unwatch();
-    try { await poller.close(); await jobs.close(); await library.close(); } finally { release(); }
+    unsubscribe(); unwatch(); unsubscribeDownloads();
+    try { await analysis.close(); await poller.close(); await jobs.close(); await library.close(); } finally { release(); }
   })();
   server.on('close', () => { cleanup().catch(e => log.error(e.message)); });
   server.on('error', error => { cleanup().catch(e => log.error(e.message)); log.error(`服务启动失败: ${error.message}`); });
@@ -404,6 +434,7 @@ export function startServer(port = 8787, host = '127.0.0.1', options = {}) {
     const address = server.address();
     const actualPort = typeof address === 'object' && address ? address.port : port;
     log.info(`Web UI 与 HTTP API 已启动: http://127.0.0.1:${actualPort}`);
+    analysis.configure();
     try { poller.configure({ resume: true }); } catch (error) { poller.lastError = redact(error.message); log.error(`轮询启动失败: ${poller.lastError}`); }
   });
   return server;

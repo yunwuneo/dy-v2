@@ -3,6 +3,7 @@ import path from 'node:path';
 import { config, configPath, ROOT_DIR, SETTINGS, RESTART_FIELDS, validateField, normalizeWatchers, reloadConfig, configStatus } from './config.js';
 import { atomicJson, withFileLock } from './persistence.js';
 import { cachedName } from './profile-cache.js';
+import { validateAnalysisConfig } from './config.js';
 
 export { SETTINGS };
 
@@ -22,6 +23,8 @@ export function publicSettings() {
     apiKeyConfigured: Boolean(config.apiKey),
     apiKeyFromEnv: Boolean(process.env.TIKHUB_API_KEY),
     cookieConfigured: Boolean(config.cookie),
+    analysisApiKeyConfigured: Boolean(config.analysisApiKey),
+    analysisAudioApiKeyConfigured: Boolean(config.analysisAudioApiKey),
     watchers: config.watchers.map(({ cookie, ...watcher }) => ({ ...watcher, cachedName: cachedName(watcher.identifier), cookieConfigured: Boolean(cookie) })),
     restartRequired: restartFields.length > 0, restartFields,
     reloadError: configStatus.reloadError,
@@ -32,13 +35,18 @@ export function saveSettings(input) {
   if (!input || typeof input !== 'object' || Array.isArray(input)) throw new Error('设置格式无效');
   if (input.fields && (typeof input.fields !== 'object' || Array.isArray(input.fields))) throw new Error('设置格式无效');
   const fields = Object.fromEntries(Object.entries(input.fields || {}).map(([key, value]) => [key, validateField(key, value)]));
-  for (const key of ['apiKey', 'cookie']) if (input[key] !== undefined && (typeof input[key] !== 'string' || input[key].length > 10000)) throw new Error(`${key} 格式无效`);
+  for (const key of ['apiKey', 'cookie', 'analysisApiKey', 'analysisAudioApiKey']) if (input[key] !== undefined && (typeof input[key] !== 'string' || input[key].length > 10000)) throw new Error(`${key} 格式无效`);
+  if (input.clearAnalysisAudioApiKey && input.analysisAudioApiKey) throw new Error('不能同时填写并清除云端语音密钥');
+  if (input.clearAnalysisApiKey && input.analysisApiKey) throw new Error('不能同时填写并清除分析密钥');
   if (input.clearApiKey && input.apiKey) throw new Error('不能同时填写并清除 API Key');
   if (input.clearCookie && input.cookie) throw new Error('不能同时填写并清除 Cookie');
   withFileLock(configPath, () => {
     const saved = read();
     Object.assign(saved, fields);
-    for (const key of ['apiKey', 'cookie']) if (input[key]) saved[key] = input[key];
+    validateAnalysisConfig({ ...config, ...saved });
+    for (const key of ['apiKey', 'cookie', 'analysisApiKey', 'analysisAudioApiKey']) if (input[key]) saved[key] = input[key];
+    if (input.clearAnalysisAudioApiKey) delete saved.analysisAudioApiKey;
+    if (input.clearAnalysisApiKey) delete saved.analysisApiKey;
     if (input.clearApiKey) delete saved.apiKey;
     if (input.clearCookie) delete saved.cookie;
     atomicJson(configPath, saved);

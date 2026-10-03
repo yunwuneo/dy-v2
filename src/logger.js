@@ -8,7 +8,7 @@ export function redact(value) {
   if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value).map(([key, entry]) => [key, /cookie|authorization|api.?key|token|password|secret/i.test(key) ? '[REDACTED]' : redact(entry)]));
   if (typeof value !== 'string') return value;
   let result = value;
-  for (const secret of [...configSecrets, config.apiKey, config.cookie, ...(config.watchers || []).map(w => w.cookie)].filter(Boolean)) result = result.split(secret).join('[REDACTED]');
+  for (const secret of [...configSecrets, config.apiKey, config.cookie, config.analysisApiKey, config.analysisAudioApiKey, ...(config.watchers || []).map(w => w.cookie)].filter(Boolean)) result = result.split(secret).join('[REDACTED]');
   return result.replace(/([?&](?:cookie|token|api_key|signature)=)[^&\s]+/gi, '$1[REDACTED]');
 }
 export const recentLogs = (after = 0) => recent.filter(entry => entry.id > after);

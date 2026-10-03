@@ -10,6 +10,7 @@
 - ✅ 内置 **Web UI**：查询和下载作品，并在管理后台预览、筛选与删除本地内容
 - ✅ **控制台与后台任务**：排队、并发下载、实时进度、取消、重试和任务历史
 - ✅ **大媒体库**：后台线程建立索引，服务端搜索、筛选和分页
+- ✅ **视频分析**：接入 video-analyzer，支持批量队列、随时启停、中文描述、关键词/标签提取与优先检索
 
 > 本项目仅用于个人学习与合法用途，请遵守抖音平台用户协议及相关法律法规，勿用于侵权或商业盗用。
 
@@ -120,6 +121,82 @@ downloads/
 元数据 JSON 包含作品描述、创建时间、时长、作者信息、点赞/评论/分享/收藏数、BGM 等，并附 `local` 字段记录本地落盘路径与大小，便于后续管理。已下载但缺元数据的存量作品会在轮询/下载时自动补写。可用 `"saveMetadata": false` 关闭该功能。
 
 已有 `data/downloaded.json` 自动作为下载记录快照读取，新操作追加到 `downloaded.json.jsonl`。跨进程文件锁保护读写，每 2,000 次操作原子更新快照并压缩日志；不要只复制快照而遗漏日志。记录损坏会报错，避免静默丢失历史。轮询时会自动跳过已下载项，实现增量下载。
+
+---
+
+## 视频分析（WebUI）
+
+使用 [byjlw/video-analyzer](https://github.com/byjlw/video-analyzer) 的 `VideoProcessor`、`AudioProcessor`、`VideoAnalyzer` 和模型客户端进行抽帧、语音转录、逐帧分析与描述生成。随后通过同一模型提取关键词和标签。Node 服务通过 Python 子进程调用这些组件；分析连接与 TikHub 下载连接独立。
+
+### 安装分析环境
+
+安装 Python 3.11+ 与 FFmpeg，并确保 FFmpeg 在 PATH 中。在项目目录创建独立 Python 环境：
+
+```powershell
+# Windows（安装 Python 后）
+py -3.11 -m venv .venv-analysis
+.\.venv-analysis\Scripts\python.exe -m pip install "setuptools<81"
+.\.venv-analysis\Scripts\python.exe -m pip install "git+https://github.com/byjlw/video-analyzer.git"
+```
+
+macOS / Linux 使用 `python3 -m venv .venv-analysis`，后续命令的 Python 路径改为 `.venv-analysis/bin/python`。上游目前使用 `pkg_resources`，因此先安装兼容的 setuptools。Python 包、Whisper 模型和视觉模型可能需要较大的下载与运行空间。Node 下载功能不依赖这些分析组件。
+
+在 WebUI「设置 → 视频分析」填写此环境的 **Python 可执行文件绝对路径**。本地 Ollama 可使用：
+
+```bash
+ollama pull llama3.2-vision
+ollama serve
+```
+
+URL 填 `http://127.0.0.1:11434`，模型填 `llama3.2-vision`；也可选择 OpenAI 兼容服务，填写供应商的 API 基础 URL（通常包含 `/v1`）、支持图像输入的模型与独立分析密钥。URL 不包含 `/chat/completions`。分析密钥留空保留原值，勾选清除才会删除；接口与日志不回传密钥明文，密钥通过 stdin 传入 Python。使用远程模型时视频帧、描述以及启用转录时的语音文字会发送给配置的服务。
+
+### 使用与恢复
+
+**语音语言与云端转录**：在「设置 → 视频分析」中启用语音转录，可选择本地 Whisper 或云端语音模型。语言默认 `auto` 自动识别，也可指定 `zh` 中文、`en` 英语、`ja` 日语等语言代码。指定语言同时适用于本地和云端，实际支持范围取决于模型；仅英语模型不适合中文等多语言转录。转录保留原语言，视频描述与关键词/标签仍要求简体中文。
+
+云端使用兼容的 `POST /audio/transcriptions` 接口（multipart 文件上传），例如 [Groq 转录接口](https://console.groq.com/docs/speech-to-text)。填写供应商的 API **基础 URL**、语音模型 ID 和独立语音密钥，程序追加 `/audio/transcriptions`。不复用视频分析密钥；密钥留空保留原值，勾选清除才删除。默认不配置任何云端服务。云端模式不会加载本地 Whisper 权重，仍需 Python 分析环境及 FFmpeg。
+
+上传内容为 FFmpeg 提取的 16 kHz 单声道 WAV 音轨，按最长 10 分钟分段（每段约不超过 19.2 MB），逐段转录后按顺序合并。请求包含 `file`、`model`、`response_format=json`，指定语言时另传 `language`；自动识别时省略该参数。服务需支持这些参数及音频规格。每段会单独调用服务；网络、额度、模型错误会显示警告并继续画面分析，不自动改用其他服务。结果详情显示转录方式、模型及语言；云端未返回识别语言时明确标注未返回。
+
+- **视频分析页**提供启动/停止、全库批量入队、状态筛选、分页结果、失败重试与取消单个任务。点击关键词或标签即可跳转媒体库检索。
+- **已下载页**可勾选视频批量分析，或将全部符合当前搜索/用户/分类条件的视频入队（不限于当前页）。图集不参与分析。详情中可查看描述、标签、转录与重新分析。
+- **默认自动分析**由 `analysisAuto` 控制，初始关闭。启用后，Web 服务内普通下载及轮询下载成功的视频会自动入队。**分析进程开关** `analysisEnabled` 独立控制消费队列，初始关闭；两项都开启即下载后自动分析。独立 CLI/MCP 进程下载的文件可在 Web 中批量入队。
+- 启停状态会保存，已启用的分析进程在 Web 服务重启后恢复。停止会终止当前 Python 分析进程，当前视频重新进入等待队列；再次启动从该视频开头处理。取消单项任务则不会自动恢复。下载进程继续独立运行。
+- 展示真实处理阶段与逐帧完成数量。语音/抽帧/描述/标签阶段没有准确百分比时显示不定进度。音频不可用时标注警告并继续画面分析；帧分析失败或标签格式无效则任务失败，可重试。
+- 结果与队列保存于 `dataDir/analysis.json`，包括描述、关键词、标签、转录、模型、时间、错误及进度。停止/重启保留队列；重复批量提交跳过已完成/已入队项目，失败项目可再次入队。重新分析失败时保留上次成功结果。
+- 检索覆盖原作品信息、分析描述、关键词和标签。排序为 **关键词/标签命中 → 描述命中 → 原作品信息命中**，同等级维持下载时间顺序，排序后再分页。删除本地视频会中止对应分析并清理记录。
+
+| 配置 | 默认值 | 说明 |
+| --- | --- | --- |
+| `analysisAuto` | `false` | Web 下载成功后自动入队 |
+| `analysisEnabled` | `false` | 持久化的分析进程启停状态 |
+| `analysisClient` | `ollama` | `ollama` 或 `openai_api` |
+| `analysisUrl` | `http://127.0.0.1:11434` | 独立模型服务基础 URL |
+| `analysisModel` | `llama3.2-vision` | 支持图像输入的分析模型 |
+| `analysisApiKey` | 空 | 独立分析密钥，保存于已忽略的 config.json |
+| `analysisPython` | `python` | 安装 video-analyzer 的 Python 可执行文件 |
+| `analysisMaxFrames` | `12` | 最多分析帧数，1–200，控制耗时与模型调用量 |
+| `analysisAudio` | `true` | 是否启用语音转录 |
+| `analysisLanguage` | `auto` | 自动识别或指定语言代码，如 `zh`、`en` |
+| `analysisAudioProvider` | `local` | 本地 `local` 或云端 `cloud` |
+| `analysisAudioUrl` | 空 | 云端语音服务基础 URL |
+| `analysisAudioModel` | 空 | 云端语音模型 ID |
+| `analysisAudioApiKey` | 空 | 独立云端语音密钥 |
+| `analysisWhisperModel` | `base` | Whisper 模型名称或本地路径 |
+| `analysisTimeoutSeconds` | `1800` | 单视频分析总超时 |
+
+| HTTP 路由 | 方法 | 说明 |
+| --- | --- | --- |
+| `/api/analysis` | GET | 状态、统计、分页任务与结果；支持 `offset`、`limit`、`status` |
+| `/api/analysis/queue` | POST | `{ids:[媒体ID],force:false}` 或 `{all:true,filters:{search,user,type}}`，仅入队 |
+| `/api/analysis/start` | POST | 启动并保存状态 |
+| `/api/analysis/stop` | POST | 停止当前进程并保留队列 |
+| `/api/analysis/cancel` | POST | `{id:媒体ID}`，取消单项任务 |
+| `/api/library/item?id=...` | GET | `analysis` 字段包含完整结果与转录 |
+
+分析设置保存后用于后续任务；正在运行的任务沿用开始时的设置，可停止后重启以应用新模型。分析队列串行执行，避免同时加载多个模型。测试使用模拟分析器与本地子进程，不调用真实模型或产生模型 API 费用。
+
+`npm test` 覆盖队列、启停、HTTP、持久化与搜索排序；`python -m unittest discover -s test -p "*_test.py"` 覆盖 Python 桥接、静态画面回退、语音失败降级和输出解析（使用模拟上游组件）。
 
 ---
 

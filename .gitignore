@@ -1,5 +1,7 @@
 # 依赖
 node_modules/
+.venv-analysis/
+__pycache__/
 
 # 配置（含密钥，不提交）
 config.json

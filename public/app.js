@@ -1,5 +1,8 @@
 const $ = (selector) => document.querySelector(selector);
 const state = { videos: [], lookupId: null, config: null, libraryItems: [], libraryTotal: 0, libraryHasMore: false, libraryRequest: 0, selectedItem: null, view: 'console', taskLimit: 30, watchers: [], editingWatcher: -1, poller: null };
+const analysisSelection = new Set();
+const analysisLabels = { queued: '等待分析', running: '分析中', stopping: '正在停止', completed: '已完成', failed: '失败', cancelled: '已取消', loading: '加载模型', audio: '处理语音', audio_extract: '提取云端转录音轨', audio_cloud: '云端语音转录', extracting: '提取视频帧', frames: '分析视频帧', description: '生成描述', labels: '提取关键词 / 标签' };
+let analysisTimer, analysisBusy = false, analysisOffset = 0, analysisLastRender = '';
 
 function compactNumber(value) {
   return new Intl.NumberFormat('zh-CN', { notation: 'compact', maximumFractionDigits: 1 }).format(Number(value) || 0);
@@ -262,6 +265,7 @@ function renderLibrary() {
   $('#library-results-title').textContent = `${state.libraryTotal} 条内容`;
   $('#library-empty').hidden = filtered.length > 0;
   $('#library-more').hidden = !state.libraryHasMore;
+  $('#analyze-filtered').disabled = $('#library-kind').value === 'album';
 
   for (const item of visible) {
     const node = $('#library-row-template').content.cloneNode(true);
@@ -279,8 +283,18 @@ function renderLibrary() {
     badge.textContent = item.kind === 'video' ? '视频' : `${item.fileCount} 张`;
     node.querySelector('.library-title-cell strong').textContent = item.title;
     node.querySelector('.library-title-cell small').textContent = item.awemeId || (item.kind === 'video' ? '视频' : `${item.fileCount} 张图片`);
+    if (item.analysis || item.searchMatch) {
+      node.querySelector('.library-title-cell').append(element('small', 'analysis-hint', [item.searchMatch ? `命中：${item.searchMatch}` : '', analysisLabels[item.analysis?.status], ...(item.analysis?.tags || []), ...(item.analysis?.keywords || []).slice(0, 4)].filter(Boolean).join(' · ')));
+    }
     node.querySelector('.library-owner strong').textContent = item.displayUser || item.user;
     node.querySelector('.library-owner small').textContent = item.type;
+    if (item.kind === 'video') {
+      const label = element('label', 'analysis-select', '选中分析');
+      const check = element('input'); check.type = 'checkbox'; check.checked = analysisSelection.has(item.id);
+      check.setAttribute('aria-label', `选择分析 ${item.title}`);
+      check.addEventListener('change', () => { if (check.checked) analysisSelection.add(item.id); else analysisSelection.delete(item.id); updateAnalysisSelection(); });
+      label.prepend(check); node.querySelector('.library-owner').append(label);
+    }
     node.querySelector('time').textContent = formatDate(item.downloadedAt);
     node.querySelector('.library-size').textContent = formatBytes(item.size);
     const open = () => openLibraryItem(item.id);
@@ -422,6 +436,7 @@ async function openLibraryItem(id) {
     const share = $('#detail-share');
     share.hidden = !item.shareUrl;
     share.href = item.shareUrl || '#';
+    renderDetailAnalysis(item);
     $('#detail-dialog').showModal();
   } catch (error) {
     libraryNotice(error.message, true);
@@ -429,13 +444,15 @@ async function openLibraryItem(id) {
 }
 
 function switchView(view) {
-  if (!['console', 'download', 'library', 'watchers', 'billing', 'settings'].includes(view)) view = 'console';
+  if (!['console', 'download', 'library', 'analysis', 'watchers', 'billing', 'settings'].includes(view)) view = 'console';
   state.view = view;
   clearTimeout(watcherTimer);
-  for (const name of ['console', 'download', 'library', 'watchers', 'billing', 'settings']) $(`#${name}-view`).hidden = name !== view;
+  clearTimeout(analysisTimer);
+  for (const name of ['console', 'download', 'library', 'analysis', 'watchers', 'billing', 'settings']) $(`#${name}-view`).hidden = name !== view;
   for (const tab of document.querySelectorAll('.nav-tab')) { tab.classList.toggle('active', tab.dataset.view === view); tab.setAttribute('aria-current', tab.dataset.view === view ? 'page' : 'false'); }
   if (location.hash !== `#${view}`) history.replaceState(null, '', `#${view}`);
   if (view === 'library') loadLibrary();
+  if (view === 'analysis') loadAnalysis();
   if (view === 'console') loadConsole();
   if (view === 'watchers') loadWatchers();
   if (view === 'billing') loadBilling();
@@ -473,6 +490,7 @@ $('#confirm-delete').addEventListener('click', async () => {
   button.textContent = '删除中...';
   try {
     await request(`/api/library/item?id=${encodeURIComponent(state.selectedItem.id)}`, { method: 'DELETE' });
+    analysisSelection.delete(state.selectedItem.id); updateAnalysisSelection();
     $('#delete-dialog').close();
     $('#detail-dialog').close();
     state.selectedItem = null;
@@ -727,6 +745,11 @@ async function loadSettings() {
     }
     form.elements.apiKey.value = '';
     form.elements.cookie.value = '';
+    form.elements.analysisApiKey.value = '';
+    form.elements.clearAnalysisApiKey.checked = false;
+    form.elements.analysisAudioApiKey.value = '';
+    form.elements.clearAnalysisAudioApiKey.checked = false;
+    updateAudioSettings();
     form.elements.clearApiKey.checked = false;
     form.elements.clearCookie.checked = false;
     renderSecretStatus(data);
@@ -735,6 +758,8 @@ async function loadSettings() {
   } catch (error) { settingsNotice(error.message, true); }
 }
 function renderSecretStatus(data) {
+  $('#analysis-audio-key-status').textContent = data.analysisAudioApiKeyConfigured ? '已有独立语音密钥，留空保持不变。' : '尚未配置语音密钥。';
+  $('#analysis-key-status').textContent = data.analysisApiKeyConfigured ? '已有独立分析密钥，留空保持不变。' : '尚未配置分析密钥。';
   $('#api-key-status').textContent = data.apiKeyFromEnv ? '环境变量优先；修改配置文件中的密钥不会覆盖它。' : data.apiKeyConfigured ? '已有密钥，留空保持不变。' : '尚未配置。';
   $('#cookie-status').textContent = data.cookieConfigured ? '已有 Cookie，留空保持不变。' : '尚未配置。';
 }
@@ -748,20 +773,38 @@ $('#settings-form').addEventListener('submit', async event => {
   const form = event.currentTarget;
   const fields = {};
   for (const input of form.querySelectorAll('[name]')) {
-    if (['apiKey', 'cookie', 'clearApiKey', 'clearCookie'].includes(input.name)) continue;
+    if (['apiKey', 'cookie', 'clearApiKey', 'clearCookie', 'analysisApiKey', 'clearAnalysisApiKey', 'analysisAudioApiKey', 'clearAnalysisAudioApiKey'].includes(input.name)) continue;
     fields[input.name] = input.type === 'checkbox' ? input.checked : input.type === 'number' ? Number(input.value) : input.value.trim();
   }
   const button = form.querySelector('[type="submit"]'); button.disabled = true;
   try {
-    const data = await request('/api/settings', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ fields, apiKey: form.elements.apiKey.value, cookie: form.elements.cookie.value, clearApiKey: form.elements.clearApiKey.checked, clearCookie: form.elements.clearCookie.checked }) });
+    const data = await request('/api/settings', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ fields, apiKey: form.elements.apiKey.value, cookie: form.elements.cookie.value, clearApiKey: form.elements.clearApiKey.checked, clearCookie: form.elements.clearCookie.checked, analysisApiKey: form.elements.analysisApiKey.value, clearAnalysisApiKey: form.elements.clearAnalysisApiKey.checked, analysisAudioApiKey: form.elements.analysisAudioApiKey.value, clearAnalysisAudioApiKey: form.elements.clearAnalysisAudioApiKey.checked }) });
     renderRestartStatus(data);
     renderSecretStatus(data);
     settingsNotice(data.restartRequired ? '设置已保存并热重载；下载目录或数据目录变更需重启服务。' : '设置已保存并热重载，无需重启。');
     form.elements.apiKey.value = ''; form.elements.cookie.value = '';
+    form.elements.analysisApiKey.value = ''; form.elements.clearAnalysisApiKey.checked = false;
+    form.elements.analysisAudioApiKey.value = ''; form.elements.clearAnalysisAudioApiKey.checked = false;
     form.elements.clearApiKey.checked = false; form.elements.clearCookie.checked = false;
   } catch (error) { settingsNotice(error.message, true); }
   finally { button.disabled = false; }
 });
+function updateAudioSettings() {
+  const form = $('#settings-form');
+  const enabled = form.elements.analysisAudio.checked;
+  const cloud = form.elements.analysisAudioProvider.value === 'cloud';
+  form.elements.analysisAudioProvider.disabled = !enabled;
+  form.elements.analysisLanguage.disabled = !enabled;
+  for (const [selector, visible] of [['[data-audio-local]', enabled && !cloud], ['[data-audio-cloud]', enabled && cloud]]) {
+    for (const group of form.querySelectorAll(selector)) {
+      group.hidden = !visible;
+      for (const input of group.querySelectorAll('input')) input.disabled = !visible;
+    }
+  }
+  form.elements.analysisAudioUrl.required = enabled && cloud;
+  form.elements.analysisAudioModel.required = enabled && cloud;
+}
+for (const name of ['analysisAudio', 'analysisAudioProvider']) $('#settings-form').elements[name].addEventListener('change', updateAudioSettings);
 async function loadConsole() {
   if (consoleBusy) return;
   consoleBusy = true;
@@ -794,5 +837,132 @@ async function loadConsole() {
 }
 $('#task-filter').addEventListener('change', () => { state.taskLimit = 30; loadConsole(); });
 $('#tasks-more').addEventListener('click', () => { state.taskLimit = Math.min(200, state.taskLimit + 30); loadConsole(); });
-document.addEventListener('visibilitychange', () => { if (!document.hidden && state.view === 'console') loadConsole(); if (!document.hidden && state.view === 'watchers') loadWatchers(); });
+function updateAnalysisSelection() {
+  $('#analyze-selected').disabled = !analysisSelection.size;
+  $('#analyze-selected').textContent = `分析所选 (${analysisSelection.size})`;
+}
+function analysisPost(action, data = {}) {
+  return request(`/api/analysis/${action}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) });
+}
+async function queueAnalysis(data, noticeTarget = '#analysis-notice') {
+  try {
+    const result = await analysisPost('queue', data);
+    settingsNotice(`已加入 ${result.added} 个视频，跳过 ${result.skipped} 个。${result.enabled ? '分析进程已启用。' : '队列已保存，请在视频分析页启动分析。'}`, false, noticeTarget);
+    if (state.view === 'analysis') await loadAnalysis();
+    return true;
+  } catch (error) { settingsNotice(error.message, true, noticeTarget); return false; }
+}
+function renderAnalysisResult(container, result) {
+  if (!result) return;
+  container.append(element('p', 'analysis-description', result.description));
+  for (const [key, label] of [['keywords', '关键词'], ['tags', '标签']]) {
+    const row = element('div', 'analysis-chips'); row.append(element('span', '', `${label}：`));
+    for (const word of result[key] || []) {
+      const chip = element('button', 'analysis-chip', word); chip.type = 'button';
+      chip.addEventListener('click', () => {
+        $('#detail-dialog').close(); $('#library-search').value = word;
+        for (const name of ['kind', 'user', 'type']) $(`#library-${name}`).value = '';
+        switchView('library');
+      });
+      row.append(chip);
+    }
+    container.append(row);
+  }
+  for (const warning of result.warnings || []) container.append(element('p', 'form-hint', warning));
+}
+function renderDetailAnalysis(item) {
+  const container = $('#detail-analysis'); container.replaceChildren(); container.hidden = item.kind !== 'video';
+  if (item.kind !== 'video') return;
+  container.append(element('h3', '', '视频分析'));
+  const record = item.analysis;
+  container.append(element('p', 'form-hint', record ? analysisProgressText(record) : '尚未分析'));
+  if (record?.error) container.append(element('p', 'analysis-error', record.error));
+  if (record?.result) {
+    container.append(element('p', 'form-hint', `${record.result.model} · ${formatDate(record.result.completedAt)}`));
+    renderAnalysisResult(container, record.result);
+    if (record.result.transcript) {
+      const result = record.result;
+      const language = result.transcriptLanguage || (result.transcriptRequestedLanguage !== 'auto' ? result.transcriptRequestedLanguage : '自动识别（服务未返回语言）');
+      container.append(element('p', 'form-hint', `语音：${result.transcriptProvider === 'cloud' ? '云端' : '本地'} · ${result.transcriptModel || '未记录模型'} · 语言：${language}`));
+      const transcript = element('details'); transcript.append(element('summary', '', '语音转录'), element('p', 'analysis-description', record.result.transcript)); container.append(transcript);
+    }
+  }
+  const button = element('button', 'secondary', record?.result ? '重新分析' : '加入分析队列'); button.type = 'button';
+  button.disabled = ['queued', 'running', 'stopping'].includes(record?.status);
+  button.addEventListener('click', async () => {
+    button.disabled = true;
+    if (await queueAnalysis({ ids: [item.id], force: Boolean(record?.result) })) { $('#detail-dialog').close(); switchView('analysis'); }
+    else { button.disabled = false; container.append(element('p', 'analysis-error', $('#analysis-notice').textContent)); }
+  });
+  container.append(button);
+}
+function analysisProgressText(record) {
+  const parts = [analysisLabels[record.status] || record.status];
+  if (record.stage !== record.status) parts.push(analysisLabels[record.stage] || record.stage);
+  if (record.status === 'running' && record.progress.total) parts.push(`${record.progress.completed}/${record.progress.total} ${record.stage === 'audio_cloud' ? '段音频' : '帧'}`);
+  return parts.join(' · ');
+}
+async function loadAnalysis() {
+  if (analysisBusy) return;
+  analysisBusy = true; clearTimeout(analysisTimer);
+  try {
+    const data = await request(`/api/analysis?offset=${analysisOffset}&limit=30&status=${encodeURIComponent($('#analysis-filter').value)}`);
+    $('#analysis-state').textContent = `${data.stopping ? '正在停止当前进程' : data.enabled ? '分析进程已启用' : '分析进程已停止'} · 新下载自动入队：${data.auto ? '开启' : '关闭'}`;
+    $('#analysis-start').disabled = data.enabled;
+    $('#analysis-stop').disabled = !data.enabled;
+    for (const status of ['queued', 'running', 'completed', 'failed']) $(`#analysis-${status}`).textContent = data.counts[status] || 0;
+    $('#analysis-total').textContent = `${data.total} 个任务`;
+    $('#analysis-prev').disabled = analysisOffset === 0;
+    $('#analysis-next').disabled = !data.hasMore;
+    const signature = JSON.stringify(data.items);
+    if (signature !== analysisLastRender) {
+      analysisLastRender = signature;
+      const list = $('#analysis-list'); list.replaceChildren();
+      if (!data.items.length) list.append(element('p', 'empty-state', '暂无分析任务。批量添加已下载视频，或在已下载页选择视频。'));
+      for (const record of data.items) {
+        const card = element('article', 'analysis-card');
+        card.append(element('h3', '', record.title));
+        card.append(element('p', 'form-hint', analysisProgressText(record)));
+        if (record.status === 'running') {
+          const progress = element('progress'); progress.max = record.progress.total || 1;
+          if (['frames', 'audio_cloud'].includes(record.stage) && record.progress.total) progress.value = record.progress.completed;
+          progress.setAttribute('aria-label', record.stage === 'audio_cloud' ? '音频分段转录进度' : '当前视频逐帧分析进度'); card.append(progress);
+        }
+        if (record.error) card.append(element('p', 'analysis-error', record.error));
+        renderAnalysisResult(card, record.result);
+        const actions = element('div', 'analysis-actions');
+        const detail = element('button', 'secondary', '查看视频与完整结果'); detail.type = 'button'; detail.addEventListener('click', () => openLibraryItem(record.id)); actions.append(detail);
+        if (['queued', 'running'].includes(record.status)) {
+          const cancel = element('button', 'danger-button', '取消任务'); cancel.type = 'button';
+          cancel.addEventListener('click', async () => { cancel.disabled = true; try { await analysisPost('cancel', { id: record.id }); await loadAnalysis(); } catch (error) { settingsNotice(error.message, true, '#analysis-notice'); } finally { cancel.disabled = false; } }); actions.append(cancel);
+        } else if (record.status !== 'stopping') {
+          const retry = element('button', 'secondary', record.result ? '重新分析' : '重试'); retry.type = 'button';
+          retry.addEventListener('click', async () => { retry.disabled = true; await queueAnalysis({ ids: [record.id], force: true }); retry.disabled = false; }); actions.append(retry);
+        }
+        card.append(actions); list.append(card);
+      }
+    }
+  } catch (error) { settingsNotice(`分析状态更新失败：${error.message}`, true, '#analysis-notice'); }
+  finally { analysisBusy = false; analysisTimer = setTimeout(() => { if (state.view === 'analysis' && !document.hidden) loadAnalysis(); }, 2000); }
+}
+for (const action of ['start', 'stop']) $(`#analysis-${action}`).addEventListener('click', async event => {
+  event.currentTarget.disabled = true;
+  try { await analysisPost(action); settingsNotice(action === 'start' ? '分析已启动，正在处理队列。' : '分析已停止，队列已保留。', false, '#analysis-notice'); await loadAnalysis(); }
+  catch (error) { settingsNotice(error.message, true, '#analysis-notice'); }
+  finally { await loadAnalysis(); }
+});
+$('#analysis-all').addEventListener('click', async event => { const button = event.currentTarget; button.disabled = true; await queueAnalysis({ all: true }); button.disabled = false; });
+$('#analysis-refresh').addEventListener('click', loadAnalysis);
+$('#analysis-settings').addEventListener('click', () => switchView('settings'));
+$('#analysis-filter').addEventListener('change', () => { analysisOffset = 0; loadAnalysis(); });
+$('#analysis-prev').addEventListener('click', () => { analysisOffset = Math.max(0, analysisOffset - 30); loadAnalysis(); });
+$('#analysis-next').addEventListener('click', () => { analysisOffset += 30; loadAnalysis(); });
+$('#analyze-selected').addEventListener('click', async () => {
+  if (await queueAnalysis({ ids: [...analysisSelection] }, '#library-notice')) { analysisSelection.clear(); updateAnalysisSelection(); renderLibrary(); }
+});
+$('#analyze-filtered').addEventListener('click', async event => {
+  const button = event.currentTarget; button.disabled = true;
+  await queueAnalysis({ all: true, filters: { search: $('#library-search').value.trim(), user: $('#library-user').value, type: $('#library-type').value } }, '#library-notice'); button.disabled = false;
+});
+document.addEventListener('visibilitychange', () => { if (!document.hidden && state.view === 'console') loadConsole(); if (!document.hidden && state.view === 'watchers') loadWatchers(); if (!document.hidden && state.view === 'analysis') loadAnalysis(); });
 switchView(location.hash.slice(1) || 'console');

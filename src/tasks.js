@@ -17,6 +17,7 @@ import {
   isTransientTikHubError,
 } from './douyin.js';
 import { downloadToFile, downloadImageToFile, detectMediaExtension, writeJsonFile, buildTargetPath } from './downloader.js';
+import { videoDownloaded } from './download-events.js';
 import { Store } from './store.js';
 import { cachedName } from './profile-cache.js';
 import { checkCancelled, mapConcurrent, withKeyLock } from './execution.js';
@@ -404,6 +405,7 @@ export async function downloadSingle(identifier) {
   if (!url) throw new Error(`未获取到下载地址: ${awemeId}`);
   const media = await downloadVideoWithFallback(info && Object.keys(info).length ? info : { video_url: url }, aweme, file, '单视频');
   saveMetadata(aweme, { file }, { file, size: media.size, fallback: media.fallback, downloaded_at: new Date().toISOString() });
+  videoDownloaded(file);
   return { aweme_id: awemeId, kind: 'video', desc, file, dir, size: media.size, url: media.url, fallback: media.fallback };
 }
 
@@ -527,6 +529,7 @@ export async function downloadVideos({
       const media = await downloadVideoWithFallback(info && Object.keys(info).length ? info : { video_url: url }, item, file, label);
       const size = media.size;
       saveMetadata(item, { file }, { file, size, fallback: media.fallback, downloaded_at: new Date().toISOString() });
+      videoDownloaded(file);
       store.mark(userKey, t, meta.awemeId);
       stats.downloaded += 1;
       stats.files.push({ aweme_id: meta.awemeId, kind: 'video', desc: meta.desc, file, size });

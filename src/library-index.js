@@ -47,8 +47,19 @@ export class LibraryIndex {
     if (refresh) this.invalidate();
     if (!this.data || !this.scannedAt || Date.now() - this.scannedAt >= this.ttlMs) await this.refresh();
     const needle = String(search).toLowerCase();
-    const matching = this.data.items.filter(item => (!kind || item.kind === kind) && (!user || item.user === user) && (!type || item.type === type)
-      && (!needle || `${item.title} ${item.author} ${item.awemeId} ${item.user} ${item.type}`.toLowerCase().includes(needle)));
+    const matching = this.data.items
+      .filter(item => (!kind || item.kind === kind) && (!user || item.user === user) && (!type || item.type === type))
+      .map(item => {
+        const analysis = this.analysisSummary?.(item.id) || null;
+        const labels = [...(analysis?.keywords || []), ...(analysis?.tags || [])];
+        const labelMatch = needle && labels.some(label => label.toLowerCase().includes(needle));
+        const descriptionMatch = needle && (analysis?.description || '').toLowerCase().includes(needle);
+        const textMatch = needle && `${item.title} ${item.author} ${item.awemeId} ${item.user} ${item.type}`.toLowerCase().includes(needle);
+        return { ...item, analysis, searchScore: labelMatch ? 3 : descriptionMatch ? 2 : textMatch ? 1 : 0,
+          searchMatch: labelMatch ? '关键词/标签' : descriptionMatch ? '分析描述' : textMatch ? '作品信息' : '' };
+      }).filter(item => !needle || item.searchScore > 0);
+    // Stable sorting keeps download order within the same relevance tier; rank before pagination.
+    if (needle) matching.sort((a, b) => b.searchScore - a.searchScore);
     return { items: matching.slice(offset, offset + limit), total: matching.length, offset, limit, hasMore: offset + limit < matching.length, summary: this.data.summary, scannedAt: new Date(this.scannedAt).toISOString() };
   }
   async close() { this.closed = true; await this.worker?.terminate(); await this.pending?.catch(() => {}); }
